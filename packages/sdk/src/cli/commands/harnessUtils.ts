@@ -31,6 +31,23 @@ import type { EffectAction, IterationResult } from "../../runtime/types";
 import type { CompressionConfig } from "../../compression/config";
 import type { HarnessPromptContext } from "./harnessPrompts";
 
+// ── Output Mode ─────────────────────────────────────────────────────
+
+/**
+ * Controls how harness commands render output and interact with the user.
+ * - "cli": ANSI-colored output to stderr, interactive readline prompts (default)
+ * - "json": Structured JSON to stdout, no ANSI, no interactive prompts
+ * - "tui": Silent — TUI manages its own display and interaction; harness
+ *   commands should not write to stderr or create readline interfaces
+ */
+export type OutputMode = "cli" | "json" | "tui";
+
+/** Derive OutputMode from legacy flags + explicit override. */
+export function resolveOutputMode(json: boolean, outputMode?: OutputMode): OutputMode {
+  if (outputMode) return outputMode;
+  return json ? "json" : "cli";
+}
+
 // ── Exported Types ───────────────────────────────────────────────────
 
 export interface HarnessCreateRunArgs {
@@ -47,6 +64,7 @@ export interface HarnessCreateRunArgs {
   existingRunId?: string;
   existingRunDir?: string;
   planOnly?: boolean;
+  outputMode?: OutputMode;
 }
 
 /** @deprecated Use HarnessCreateRunArgs instead */
@@ -63,7 +81,7 @@ export interface Phase1Progress {
 
 export interface Phase2Progress {
   phase: "2";
-  status: "started" | "resuming" | "skipped-plan-only" | "run-created" | "bound" | "iteration" | "effect" | "completed" | "failed";
+  status: "started" | "resuming" | "skipped-plan-only" | "run-created" | "bound" | "iteration" | "iteration-start" | "effect-start" | "iteration-summary" | "effect" | "completed" | "failed" | "process-error-recovery";
   runId?: string;
   runDir?: string;
   harness?: string;
@@ -79,6 +97,11 @@ export interface Phase2Progress {
   error?: string;
   output?: string;
   processPath?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  elapsedMs?: number;
+  effectsResolved?: number;
+  tokenEstimate?: number;
 }
 
 export type ProgressPayload = Phase1Progress | Phase2Progress;
@@ -229,8 +252,9 @@ export function stringifyForVerboseLog(value: unknown, maxChars: number = VERBOS
   }
 }
 
-export function writeVerboseLine(enabled: boolean, json: boolean, message: string): void {
-  if (!json && enabled) {
+export function writeVerboseLine(enabled: boolean, json: boolean, message: string, outputMode?: OutputMode): void {
+  const mode = resolveOutputMode(json, outputMode);
+  if (mode === "cli" && enabled) {
     process.stderr.write(`${DIM}${message}${RESET}\n`);
   }
 }
@@ -241,8 +265,10 @@ export function writeVerboseBlock(
   label: string,
   value: unknown,
   maxChars: number = VERBOSE_LOG_LIMIT,
+  outputMode?: OutputMode,
 ): void {
-  if (json || !enabled) {
+  const mode = resolveOutputMode(json, outputMode);
+  if (mode !== "cli" || !enabled) {
     return;
   }
   process.stderr.write(
@@ -254,8 +280,14 @@ export function emitProgress(
   payload: ProgressPayload,
   json: boolean,
   verbose: boolean,
+  outputMode?: OutputMode,
 ): void {
-  if (json) {
+  const mode = resolveOutputMode(json, outputMode);
+
+  // TUI mode: harness commands are silent — TUI manages its own display
+  if (mode === "tui") return;
+
+  if (mode === "json") {
     console.log(JSON.stringify(payload, null, 2));
     return;
   }
@@ -286,11 +318,33 @@ export function emitProgress(
         } else {
           process.stderr.write(`${DIM}session bound via ${payload.harness}: ${payload.sessionId}${RESET}\n`);
         }
+      } else if (payload.status === "iteration-start") {
+        const elapsed = payload.elapsedMs != null ? ` [${formatElapsed(payload.elapsedMs)}]` : "";
+        process.stderr.write(`\n${DIM}-- iteration ${payload.iteration} starting...${elapsed} --${RESET}\n`);
       } else if (payload.status === "iteration") {
         process.stderr.write(`\n${DIM}-- iteration ${payload.iteration} --${RESET} status=${payload.runStatus} pending=${payload.pendingEffects}\n`);
+      } else if (payload.status === "effect-start") {
+        const label = payload.effectTitle ?? payload.effectId ?? "unknown";
+        const via = payload.effectHarness ? ` ${DIM}via ${payload.effectHarness}${RESET}` : "";
+        process.stderr.write(`  ${CYAN}▸${RESET} ${MAGENTA}${payload.effectKind}${RESET} ${label}${via}...\n`);
       } else if (payload.status === "effect") {
         const icon = payload.effectStatus === "ok" ? `${GREEN}✓${RESET}` : `${RED}✗${RESET}`;
-        process.stderr.write(`  ${icon} ${MAGENTA}${payload.effectKind}${RESET} ${payload.effectTitle ?? payload.effectId}${payload.effectStatus === "error" ? ` ${RED}${payload.error}${RESET}` : ""}\n`);
+        const elapsed = payload.elapsedMs != null ? ` ${DIM}${formatElapsed(payload.elapsedMs)}${RESET}` : "";
+        const errorSuffix = payload.effectStatus === "error" ? ` ${RED}${payload.error}${RESET}` : "";
+        process.stderr.write(`  ${icon} ${MAGENTA}${payload.effectKind}${RESET} ${payload.effectTitle ?? payload.effectId}${elapsed}${errorSuffix}\n`);
+        // Show stdout tail for shell effects and condensed output for others
+        if (payload.output) {
+          const lines = payload.output.split("\n").filter((l) => l.trim());
+          const tail = lines.slice(-5);
+          for (const line of tail) {
+            const trimmed = line.length > 160 ? line.slice(0, 160) + "..." : line;
+            process.stderr.write(`    ${DIM}${trimmed}${RESET}\n`);
+          }
+        }
+      } else if (payload.status === "iteration-summary") {
+        const elapsed = payload.elapsedMs != null ? formatElapsed(payload.elapsedMs) : "?";
+        const tokens = payload.tokenEstimate != null ? ` | ~${payload.tokenEstimate} tokens` : "";
+        process.stderr.write(`  ${DIM}${payload.effectsResolved ?? 0} effect(s) resolved in ${elapsed}${tokens}${RESET}\n`);
       } else if (payload.status === "completed") {
         process.stderr.write(`\n${GREEN}${BOLD}Run completed${RESET} ${DIM}(${payload.iteration} iterations)${RESET}\n`);
       } else if (payload.status === "failed") {
@@ -298,6 +352,40 @@ export function emitProgress(
       }
       break;
   }
+}
+
+// ── Progress Helpers ────────────────────────────────────────────────
+
+/** Format milliseconds as a human-readable elapsed duration. */
+export function formatElapsed(ms: number): string {
+  if (ms < 1000) return "<1s";
+  const totalSec = Math.floor(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return `${min}m ${sec}s`;
+}
+
+/**
+ * Create streaming output callbacks for real-time harness CLI output relay.
+ * Returns undefined for json/tui modes (those modes don't stream to stderr).
+ */
+export function createStreamingProgressCallbacks(
+  outputMode: OutputMode,
+  _harnessName: string,
+): import("../../harness/types").StreamingOutputOptions | undefined {
+  const mode = outputMode;
+  if (mode !== "cli") return undefined;
+
+  const MAX_LINE_LENGTH = 200;
+  return {
+    onLine: (line: string) => {
+      const trimmed = line.length > MAX_LINE_LENGTH
+        ? line.slice(0, MAX_LINE_LENGTH) + "..."
+        : line;
+      process.stderr.write(`${DIM}  | ${trimmed}${RESET}\n`);
+    },
+  };
 }
 
 // ── Compression ──────────────────────────────────────────────────────
@@ -418,7 +506,11 @@ export function askLine(
 
 export async function readInteractivePrompt(
   rl: readline.Interface,
+  outputMode?: OutputMode,
 ): Promise<string | null> {
+  // In TUI mode, the TUI manages its own prompt UI — never use readline here
+  if (outputMode === "tui") return null;
+
   process.stderr.write("\n");
   process.stderr.write(
     `${BOLD}${CYAN}babysitter harness:create-run${RESET}\n`,
@@ -648,7 +740,8 @@ export function isRetryablePiPromptFailure(error: unknown): boolean {
     normalized.includes("too many requests") ||
     normalized.includes("pitimeouterror") ||
     normalized.includes("pi prompt timed out") ||
-    normalized.includes("deadline exceeded");
+    normalized.includes("deadline exceeded") ||
+    normalized.includes("already processing");
 }
 
 export function isIgnorablePiPromptFailure(output: string): boolean {

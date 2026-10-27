@@ -11,6 +11,7 @@
 
 import * as path from "node:path";
 import { createClaudeCodeAdapter } from "./claudeCode";
+import { normalizeSessionStateDir } from "../config";
 import type {
   HarnessAdapter,
   HarnessCapability,
@@ -22,7 +23,7 @@ import type {
 } from "./types";
 import { HarnessCapability as Cap } from "./types";
 import type { PromptContext } from "../prompts/types";
-import { createPiContext } from "../prompts/context";
+import { createInternalContext } from "../prompts/context";
 
 function resolveInternalPluginRoot(
   args: { pluginRoot?: string } = {},
@@ -36,17 +37,9 @@ function resolveInternalStateDir(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  if (process.env.BABYSITTER_STATE_DIR) {
-    return path.resolve(process.env.BABYSITTER_STATE_DIR);
-  }
-
-  const pluginRoot = resolveInternalPluginRoot(args);
-  if (pluginRoot) {
-    return path.resolve(pluginRoot, "..", ".a5c");
-  }
-
-  return path.resolve(".a5c");
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 function resolveInternalSessionId(parsed: { sessionId?: string }): string | undefined {
@@ -88,7 +81,15 @@ export function createInternalAdapter(): HarnessAdapter {
     },
 
     getCapabilities(): HarnessCapability[] {
-      return [Cap.Programmatic, Cap.SessionBinding, Cap.StopHook, Cap.HeadlessPrompt];
+      return [
+        Cap.Programmatic,
+        Cap.SessionBinding,
+        Cap.StopHook,
+        Cap.HeadlessPrompt,
+        Cap.ConcurrentEffects,
+        Cap.BackgroundEffects,
+        Cap.MultiHarnessDispatch,
+      ];
     },
 
     async bindSession(opts: SessionBindOptions): Promise<SessionBindResult> {
@@ -144,7 +145,7 @@ export function createInternalAdapter(): HarnessAdapter {
     },
 
     getPromptContext(opts?: { interactive?: boolean | undefined }): PromptContext {
-      return createPiContext(opts);
+      return createInternalContext(opts);
     },
   };
 }

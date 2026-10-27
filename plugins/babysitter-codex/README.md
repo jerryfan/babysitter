@@ -10,9 +10,10 @@ This package ships a real Codex plugin bundle:
 - `hooks/`
 
 It still uses the Babysitter SDK CLI and the shared `~/.a5c` process-library
-state. The installer registers the plugin bundle and also materializes the
-active Codex `skills/`, `hooks/`, and `hooks.json` surface at the selected
-scope so Codex can execute the Babysitter commands and hook scripts directly.
+state. Global install writes the plugin bundle to `~/.agents/plugins/babysitter`
+and updates `~/.agents/plugins/marketplace.json` so Codex can load the plugin
+through its marketplace surface. Workspace install continues to materialize a
+workspace-local Codex surface for team setup.
 
 ## Installation
 
@@ -25,14 +26,18 @@ npm install -g @a5c-ai/babysitter-sdk
 clone the repo and install the plugin globally:
 
 ```bash
-git clone https://github.com/a5c-ai/babysitter.git
-cd babysitter
+npx -y @a5c-ai/babysitter-codex install --global
+
 codex
 
 > /plugins
 ```
 
 then navigate to the 'babysitter' entry and select 'Install'.
+
+If Codex was already open when you ran `install --global`, start a new thread
+after installing from `/plugins` before expecting `babysitter:*` skills such as
+`$babysitter:babysit` or `$babysitter:call` to appear in the mention picker.
 
 ## Integration Model
 
@@ -50,9 +55,9 @@ The process library is fetched and bound through the SDK CLI in
 
 After `install --workspace`, the important files are:
 
-- `plugins/babysitter/.codex-plugin/plugin.json`
-- `plugins/babysitter/skills/babysit/SKILL.md`
-- `plugins/babysitter/hooks.json`
+- `.agents/plugins/babysitter/.codex-plugin/plugin.json`
+- `.agents/plugins/babysitter/skills/babysit/SKILL.md`
+- `.agents/plugins/babysitter/hooks.json`
 - `.codex/skills/`
 - `.codex/hooks/`
 - `.codex/hooks.json`
@@ -67,13 +72,10 @@ Verify the installed plugin bundle:
 
 ```bash
 npm ls -g @a5c-ai/babysitter-codex --depth=0
-test -f ~/.codex/plugins/babysitter/.codex-plugin/plugin.json
-test -f ~/.codex/plugins/babysitter/hooks.json
-test -f ~/.codex/plugins/babysitter/hooks/babysitter-stop-hook.sh
-test -f ~/.codex/plugins/babysitter/skills/babysit/SKILL.md
-test -f ~/.codex/hooks.json
-test -f ~/.codex/hooks/babysitter-stop-hook.sh
-test -f ~/.codex/skills/babysit/SKILL.md
+test -f ~/.agents/plugins/babysitter/.codex-plugin/plugin.json
+test -f ~/.agents/plugins/babysitter/hooks.json
+test -f ~/.agents/plugins/babysitter/hooks/babysitter-stop-hook.sh
+test -f ~/.agents/plugins/babysitter/skills/babysit/SKILL.md
 test -f ~/.agents/plugins/marketplace.json
 ```
 
@@ -83,9 +85,10 @@ Verify the active shared process-library binding:
 babysitter process-library:active --json
 ```
 
-On native Windows, Codex currently does not execute hooks. The plugin still
-installs correctly, but the lifecycle hooks will not fire until Codex enables
-Windows hook execution.
+On native Windows, Codex hooks require **Codex CLI >= 0.119.0** (released
+2026-04-10, [openai/codex#17268](https://github.com/openai/codex/pull/17268)).
+Older Codex versions silently skipped hook execution on Windows. If hooks do
+not fire after install, run `codex --version` and upgrade if needed.
 
 ## License
 

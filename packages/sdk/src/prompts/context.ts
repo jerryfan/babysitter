@@ -12,6 +12,9 @@ const COMMON_DEFAULTS: Partial<PromptContext> = {
   hasIntentFidelityChecks: false,
   hasNonNegotiables: false,
   sdkVersionExpr: '',
+  // Always-on additions — enabled by default across harnesses.
+  hasPriorityLadder: true,
+  hasRootCauseGuardrail: true,
 };
 
 /**
@@ -30,19 +33,18 @@ export function createClaudeCodeContext(
     sessionBindingFlags: '',
     hookDriven: true,
     interactiveToolName: 'AskUserQuestion tool',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID (via CLAUDE_ENV_FILE)',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); CLAUDE_ENV_FILE and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Read the SDK version from `versions.json` to ensure version compatibility:',
       '',
       '```bash',
       'SDK_VERSION=$(node -e "try{console.log(JSON.parse(require(\'fs\').readFileSync(\'${CLAUDE_PLUGIN_ROOT}/versions.json\',\'utf8\')).sdkVersion||\'latest\')}catch{console.log(\'latest\')}")',
-      'sudo npm i -g @a5c-ai/babysitter-sdk@$SDK_VERSION',
+      'npm i -g @a5c-ai/babysitter-sdk@$SDK_VERSION',
+      'CLI="npx -y @a5c-ai/babysitter-sdk@$SDK_VERSION"',
       '```',
       '',
-      'then use the CLI alias: `CLI="babysitter"`',
-      '',
-      '**Alternatively:** `CLI="npx -y @a5c-ai/babysitter-sdk@$SDK_VERSION"`',
+      'If `babysitter` is already installed globally at the correct version, you may use `CLI="babysitter"` instead.',
     ].join('\n'),
     sdkVersionExpr: '$SDK_VERSION',
     iterateFlags: '',
@@ -69,7 +71,7 @@ export function createCodexContext(
     hookDriven: true, // overridden at instruction-generation time if session-start hook hasn't run
     interactiveToolName: 'AskUserQuestion tool',
     sessionEnvVars:
-      'BABYSITTER_SESSION_ID, CODEX_THREAD_ID (auto-injected)',
+      'PID-scoped session marker (authoritative); CODEX_THREAD_ID/CODEX_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -109,7 +111,7 @@ export function createGithubCopilotContext(
     sessionBindingFlags: '',
     hookDriven: false,
     interactiveToolName: 'AskUserQuestion tool',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID (via COPILOT_ENV_FILE or CLAUDE_ENV_FILE)',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); COPILOT_ENV_FILE / COPILOT_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -149,7 +151,7 @@ export function createCursorContext(
     sessionBindingFlags: '',
     hookDriven: true,
     interactiveToolName: 'AskUserQuestion tool',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID or conversation_id (via hook stdin JSON)',
+    sessionEnvVars: 'conversation_id from hook stdin (authoritative per-request); PID-scoped session marker; BABYSITTER_SESSION_ID fallback',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -187,7 +189,7 @@ export function createGeminiCliContext(
     sessionBindingFlags: '',
     hookDriven: true,
     interactiveToolName: 'AskUserQuestion tool',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID, GEMINI_SESSION_ID (auto-injected)',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); GEMINI_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -228,7 +230,7 @@ export function createOpenCodeContext(
     sessionBindingFlags: '',
     hookDriven: false,
     interactiveToolName: '',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID (self-injected via shell.env hook)',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); shell.env-injected session ID and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -266,7 +268,46 @@ export function createPiContext(
     sessionBindingFlags: '',
     hookDriven: false,
     interactiveToolName: 'AskUserQuestion',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID, PI_SESSION_ID, PI_PLUGIN_ROOT',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); PI_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
+    resumeFlags: '',
+    cliSetupSnippet: [
+      'Use the installed CLI alias:',
+      '',
+      '```bash',
+      'CLI="babysitter"',
+      '```',
+      '',
+      'If it is not available on the path, use:',
+      '',
+      '```bash',
+      'CLI="npx -y @a5c-ai/babysitter-sdk"',
+      '```',
+    ].join('\n'),
+    iterateFlags: '',
+    hasIntentFidelityChecks: false,
+    hasNonNegotiables: false,
+    ...overrides,
+  } as PromptContext;
+}
+
+/**
+ * Create a PromptContext pre-configured for OpenClaw.
+ */
+export function createOpenClawContext(
+  overrides?: Partial<PromptContext>,
+): PromptContext {
+  return {
+    ...COMMON_DEFAULTS,
+    harness: 'openclaw',
+    harnessLabel: 'OpenClaw',
+    capabilities: ['session-binding', 'mcp', 'headless-prompt', 'task-tool', 'breakpoint-routing'],
+    pluginRootVar: '',
+    // Daemon model: no stop-hook. Agent lifecycle managed by agent_end signal.
+    loopControlTerm: 'agent_end',
+    sessionBindingFlags: '',
+    hookDriven: false,
+    interactiveToolName: 'AskUserQuestion tool',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); OPENCLAW_SHELL gateway injection and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -301,7 +342,7 @@ export function createOhMyPiContext(
     sessionBindingFlags: '',
     hookDriven: false,
     interactiveToolName: 'AskUserQuestion',
-    sessionEnvVars: 'BABYSITTER_SESSION_ID, OMP_SESSION_ID, OMP_PLUGIN_ROOT',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); OMP_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
     resumeFlags: '',
     cliSetupSnippet: [
       'Use the installed CLI alias:',
@@ -314,6 +355,49 @@ export function createOhMyPiContext(
       '',
       '```bash',
       'CLI="npx -y @a5c-ai/babysitter-sdk"',
+      '```',
+    ].join('\n'),
+    iterateFlags: '',
+    hasIntentFidelityChecks: false,
+    hasNonNegotiables: false,
+    ...overrides,
+  } as PromptContext;
+}
+
+/**
+ * Create a PromptContext pre-configured for the internal (programmatic) harness.
+ *
+ * The internal harness is the SDK's built-in execution engine. It supports
+ * concurrent effect execution (GAP-PAR-001), async/background effects
+ * (GAP-PAR-002), and multi-harness parallel dispatch (GAP-PAR-003).
+ */
+export function createInternalContext(
+  overrides?: Partial<PromptContext>,
+): PromptContext {
+  return {
+    ...COMMON_DEFAULTS,
+    harness: 'internal',
+    harnessLabel: 'Internal (Programmatic)',
+    capabilities: [
+      'task-tool',
+      'breakpoint-routing',
+      'programmatic-session',
+      'concurrent-effects',
+      'background-effects',
+      'multi-harness-dispatch',
+    ],
+    pluginRootVar: '',
+    loopControlTerm: 'in-turn',
+    sessionBindingFlags: '',
+    hookDriven: false,
+    interactiveToolName: 'AskUserQuestion',
+    sessionEnvVars: 'PID-scoped session marker (authoritative); OMP_SESSION_ID / PI_SESSION_ID and BABYSITTER_SESSION_ID are fallbacks',
+    resumeFlags: '',
+    cliSetupSnippet: [
+      'Use the installed CLI alias:',
+      '',
+      '```bash',
+      'CLI="babysitter"',
       '```',
     ].join('\n'),
     iterateFlags: '',

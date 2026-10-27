@@ -1,7 +1,7 @@
 /**
  * Reusable agentic tool definitions for Pi sessions.
  *
- * Provides a factory that builds a standard set of 17 tools (file ops,
+ * Provides a factory that builds a standard set of 16 tools (file ops,
  * execution, browser/web, user interaction, utilities) that can be
  * injected into any Pi session via `PiSessionOptions.customTools`.
  *
@@ -12,6 +12,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as childProcess from "node:child_process";
 import { Type, type TObject } from "@sinclair/typebox";
+import { getConfig, DEFAULTS, CONFIG_ENV_VARS, type BabysitterConfig } from "../config/defaults";
+import { BackgroundProcessRegistry } from "./backgroundProcessRegistry";
+import { DeferredToolRegistry } from "./deferredToolRegistry";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -43,6 +46,12 @@ export interface AgenticToolOptions {
   askUserQuestionHandler?: (...args: unknown[]) => Promise<unknown>;
   /** Optional callback fired before each tool execution. */
   onToolUse?: (toolName: string, params: unknown) => void;
+  /** Callback fired when a background process completes. */
+  onBackgroundComplete?: (event: unknown) => void;
+  /** Maximum concurrent background processes (default 16). */
+  maxBackgroundProcesses?: number;
+  /** Optional deferred tool registry for tool_search/tool_fetch (GAP-TOOLS-034). */
+  deferredToolRegistry?: DeferredToolRegistry;
 }
 
 /** Standard tool result shape. */
@@ -72,11 +81,143 @@ export const AGENTIC_TOOL_NAMES: string[] = [
   "ast_edit",
   "render_mermaid",
   "notebook",
+  "config",
+  "background_status",
+  "background_list",
+  "tool_search",
+  "tool_fetch",
+  "web_search",
+  "fetch_process",
 ];
 
 const DEFAULT_BASH_TIMEOUT = 120_000;
+/** Maximum bytes to collect from a child process's stdout/stderr before truncating. */
+const MAX_SPAWN_OUTPUT_BYTES = 50 * 1024 * 1024; // 50 MiB
 const DEFAULT_SEARCH_TIMEOUT = 30_000;
 const MAX_READ_LINES = 10_000;
+
+// ---------------------------------------------------------------------------
+// Run-scoped config state (GAP-TOOLS-033)
+// ---------------------------------------------------------------------------
+
+/** Extended config keys beyond BabysitterConfig. */
+const EXTENDED_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "model",
+  "provider",
+  "breakpoint.autoApproveAfterN",
+  "breakpoint.presentAlwaysApprove",
+]);
+
+/** All valid top-level BabysitterConfig key names. */
+const BABYSITTER_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "runsDir",
+  "maxIterations",
+  "qualityThreshold",
+  "timeout",
+  "logLevel",
+  "allowSecretLogs",
+  "hookTimeout",
+  "nodeTaskTimeout",
+  "clockStepMs",
+  "clockStartMs",
+  "layoutVersion",
+  "largeResultPreviewLimit",
+]);
+
+/** Expected types for standard BabysitterConfig keys. */
+const CONFIG_KEY_TYPES: Record<string, string> = {
+  runsDir: "string",
+  maxIterations: "number",
+  qualityThreshold: "number",
+  timeout: "number",
+  logLevel: "string",
+  allowSecretLogs: "boolean",
+  hookTimeout: "number",
+  nodeTaskTimeout: "number",
+  clockStepMs: "number",
+  clockStartMs: "number",
+  layoutVersion: "string",
+  largeResultPreviewLimit: "number",
+  model: "string",
+  provider: "string",
+};
+
+/** Valid log level values. */
+const VALID_LOG_LEVELS = new Set(["debug", "info", "warn", "error", "silent"]);
+
+/** Map of config key to its BABYSITTER_* env var name (for global scope set). */
+const CONFIG_KEY_TO_ENV: Record<string, string> = {
+  runsDir: CONFIG_ENV_VARS.RUNS_DIR,
+  maxIterations: CONFIG_ENV_VARS.MAX_ITERATIONS,
+  qualityThreshold: CONFIG_ENV_VARS.QUALITY_THRESHOLD,
+  timeout: CONFIG_ENV_VARS.TIMEOUT,
+  logLevel: CONFIG_ENV_VARS.LOG_LEVEL,
+  allowSecretLogs: CONFIG_ENV_VARS.ALLOW_SECRET_LOGS,
+  hookTimeout: CONFIG_ENV_VARS.HOOK_TIMEOUT,
+  nodeTaskTimeout: CONFIG_ENV_VARS.NODE_TASK_TIMEOUT,
+};
+
+/** Run-scoped overrides — cleared on reset. */
+const _runScopedConfig: Map<string, unknown> = new Map();
+
+/** Reset run-scoped config (exported for test isolation). */
+export function resetRunScopedConfig(): void {
+  _runScopedConfig.clear();
+}
+
+/**
+ * Check if a key is a valid config key (standard, extended, compression.*, or breakpoint.*).
+ */
+function isValidConfigKey(key: string): boolean {
+  if (BABYSITTER_CONFIG_KEYS.has(key)) return true;
+  if (EXTENDED_CONFIG_KEYS.has(key)) return true;
+  if (key.startsWith("compression.")) return true;
+  if (key.startsWith("breakpoint.")) return true;
+  return false;
+}
+
+/**
+ * Validate value type for a config key. Returns error message or null if valid.
+ */
+function validateConfigValue(key: string, value: unknown): string | null {
+  const expectedType = CONFIG_KEY_TYPES[key];
+  if (expectedType && typeof value !== expectedType) {
+    return `Expected '${key}' to be ${expectedType}, got ${typeof value}.`;
+  }
+  // Specific validation for logLevel
+  if (key === "logLevel" && typeof value === "string" && !VALID_LOG_LEVELS.has(value)) {
+    return `Invalid logLevel '${value}'. Must be one of: ${[...VALID_LOG_LEVELS].join(", ")}.`;
+  }
+  // Number keys should be positive
+  if (expectedType === "number" && typeof value === "number") {
+    if (key !== "clockStartMs" && value <= 0) {
+      return `'${key}' must be a positive number.`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Get a single config value, merging defaults + env + run-scoped.
+ */
+function getConfigValue(key: string): unknown {
+  if (_runScopedConfig.has(key)) return _runScopedConfig.get(key);
+  if (BABYSITTER_CONFIG_KEYS.has(key)) {
+    const cfg = getConfig();
+    return cfg[key as keyof BabysitterConfig];
+  }
+  return undefined;
+}
+
+/**
+ * Get the default value for a key.
+ */
+function getConfigDefault(key: string): unknown {
+  if (BABYSITTER_CONFIG_KEYS.has(key)) {
+    return DEFAULTS[key as keyof BabysitterConfig];
+  }
+  return undefined;
+}
 
 /**
  * Resolve the ripgrep binary path.
@@ -162,21 +303,48 @@ function spawnAsync(
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
 
-    proc.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
-    proc.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+    proc.stdout?.on("data", (chunk: Buffer) => {
+      if (stdoutTruncated) return;
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > MAX_SPAWN_OUTPUT_BYTES) {
+        stdoutTruncated = true;
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+    proc.stderr?.on("data", (chunk: Buffer) => {
+      if (stderrTruncated) return;
+      stderrBytes += chunk.length;
+      if (stderrBytes > MAX_SPAWN_OUTPUT_BYTES) {
+        stderrTruncated = true;
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+
+    const concatSafe = (chunks: Buffer[], truncated: boolean, totalBytes: number): string => {
+      const text = Buffer.concat(chunks).toString("utf8");
+      return truncated
+        ? text + `\n... [truncated: ${totalBytes} bytes total, limit ${MAX_SPAWN_OUTPUT_BYTES}]`
+        : text;
+    };
 
     proc.on("close", (code) => {
       resolve({
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
-        stderr: Buffer.concat(stderrChunks).toString("utf8"),
+        stdout: concatSafe(stdoutChunks, stdoutTruncated, stdoutBytes),
+        stderr: concatSafe(stderrChunks, stderrTruncated, stderrBytes),
         exitCode: code ?? 1,
       });
     });
 
     proc.on("error", (err) => {
       resolve({
-        stdout: Buffer.concat(stdoutChunks).toString("utf8"),
+        stdout: concatSafe(stdoutChunks, stdoutTruncated, stdoutBytes),
         stderr: err.message,
         exitCode: 1,
       });
@@ -415,6 +583,25 @@ export function createAgenticToolDefinitions(
         multiline: Type.Optional(
           Type.Boolean({ description: "Enable multiline mode" }),
         ),
+        output_mode: Type.Optional(
+          Type.Union([
+            Type.Literal("content"),
+            Type.Literal("files_with_matches"),
+            Type.Literal("count"),
+          ], { description: "Output mode: 'content' (matching lines), 'files_with_matches' (file paths, default), 'count' (match counts)" }),
+        ),
+        before_context: Type.Optional(
+          Type.Number({ description: "Lines before each match (rg -B)" }),
+        ),
+        after_context: Type.Optional(
+          Type.Number({ description: "Lines after each match (rg -A)" }),
+        ),
+        line_numbers: Type.Optional(
+          Type.Boolean({ description: "Show line numbers in content mode (default true)" }),
+        ),
+        head_limit: Type.Optional(
+          Type.Number({ description: "Max output lines (default 250)" }),
+        ),
       }),
       execute: async (
         _toolCallId: string,
@@ -423,15 +610,32 @@ export function createAgenticToolDefinitions(
         const searchPath = params.path
           ? resolveSafe(workspace, String(params.path))
           : workspace;
-        const args: string[] = [
-          "--no-heading",
-          "--line-number",
-          "--color",
-          "never",
-        ];
+        const mode = (params.output_mode as string) ?? "files_with_matches";
+        const args: string[] = ["--color", "never"];
+
+        if (mode === "files_with_matches") {
+          args.push("-l");
+        } else if (mode === "count") {
+          args.push("-c");
+        } else {
+          // content mode
+          args.push("--no-heading");
+          if (params.line_numbers === false) {
+            args.push("--no-line-number");
+          } else {
+            args.push("--line-number");
+          }
+          if (params.before_context != null) args.push("-B", String(params.before_context));
+          if (params.after_context != null) args.push("-A", String(params.after_context));
+        }
+
         if (params.i) args.push("-i");
         if (params.multiline) args.push("-U", "--multiline-dotall");
-        if (params.context) args.push("-C", String(params.context));
+        const hasSplitContext =
+          params.before_context != null || params.after_context != null;
+        if (mode === "content" && params.context != null && !hasSplitContext) {
+          args.push("-C", String(params.context));
+        }
         if (params.glob) args.push("--glob", String(params.glob));
         if (params.type) args.push("--type", String(params.type));
         args.push("--", String(params.pattern), searchPath);
@@ -441,12 +645,21 @@ export function createAgenticToolDefinitions(
           timeout: DEFAULT_SEARCH_TIMEOUT,
         });
         let output = result.stdout;
+
+        // Apply head_limit (default 250, 0 = unlimited) before offset/limit
+        const rawHeadLimit = params.head_limit as number | undefined;
+        const headLimit = rawHeadLimit === 0 ? Infinity : (rawHeadLimit ?? 250);
+        const lines = output.split("\n");
+        const headLimited = lines.slice(0, headLimit);
+
         if (params.offset || params.limit) {
-          const lines = output.split("\n");
           const off = (params.offset as number) ?? 0;
           const lim = (params.limit as number) ?? 250;
-          output = lines.slice(off, off + lim).join("\n");
+          output = headLimited.slice(off, off + lim).join("\n");
+        } else {
+          output = headLimited.join("\n");
         }
+
         if (!output.trim() && result.exitCode !== 0 && result.stderr) {
           return errorResult(result.stderr.trim());
         }
@@ -513,6 +726,18 @@ export function createAgenticToolDefinitions(
         cwd: Type.Optional(
           Type.String({ description: "Working directory (relative to workspace)" }),
         ),
+        run_in_background: Type.Optional(
+          Type.Boolean({
+            description:
+              "Set to true to run the command in the background. Returns immediately with a backgroundTaskId.",
+          }),
+        ),
+        description: Type.Optional(
+          Type.String({
+            description:
+              "Human-readable description of the background task. Only used when run_in_background is true.",
+          }),
+        ),
       }),
       execute: async (
         _toolCallId: string,
@@ -521,6 +746,29 @@ export function createAgenticToolDefinitions(
         const cwd = params.cwd
           ? resolveSafe(workspace, String(params.cwd))
           : workspace;
+
+        // --- Background execution path ---
+        if (params.run_in_background === true) {
+          const registry = getBackgroundRegistry(options.maxBackgroundProcesses);
+          const record = registry.spawn({
+            command: String(params.command),
+            cwd,
+            env: (params.env as Record<string, string>) ?? undefined,
+            description: params.description ? String(params.description) : undefined,
+            onComplete: options.onBackgroundComplete
+              ? (evt) => options.onBackgroundComplete!(evt)
+              : undefined,
+          });
+          return jsonResult({
+            backgroundTaskId: record.backgroundTaskId,
+            status: record.status,
+            pid: record.pid,
+            command: record.command,
+            description: record.description,
+          });
+        }
+
+        // --- Synchronous execution path (unchanged) ---
         const timeout =
           (params.timeout as number) ?? DEFAULT_BASH_TIMEOUT;
         const shell = process.platform === "win32" ? "cmd.exe" : "/bin/bash";
@@ -783,25 +1031,35 @@ export function createAgenticToolDefinitions(
       promptSnippet:
         "Ask the user focused clarification questions when you need missing requirements.",
       parameters: Type.Object({
-        questions: Type.Array(
-          Type.Object({
-            id: Type.String({ description: "Unique question identifier" }),
-            question: Type.String({ description: "Question text" }),
-            options: Type.Optional(
-              Type.Array(
-                Type.Object({
-                  label: Type.String({ description: "Option label" }),
-                }),
-              ),
-            ),
-            multi: Type.Optional(
-              Type.Boolean({ description: "Allow multiple selections" }),
-            ),
-            recommended: Type.Optional(
-              Type.Number({ description: "Index of recommended option" }),
-            ),
+        mode: Type.Optional(
+          Type.Union([Type.Literal("simple"), Type.Literal("structured")], {
+            description: "Interaction mode: 'simple' (single question, free-text) or 'structured' (multi-question with options). Default: 'structured'",
           }),
-          { description: "Questions to ask the user" },
+        ),
+        question: Type.Optional(
+          Type.String({ description: "Single question text (required for simple mode)" }),
+        ),
+        questions: Type.Optional(
+          Type.Array(
+            Type.Object({
+              id: Type.String({ description: "Unique question identifier" }),
+              question: Type.String({ description: "Question text" }),
+              options: Type.Optional(
+                Type.Array(
+                  Type.Object({
+                    label: Type.String({ description: "Option label" }),
+                  }),
+                ),
+              ),
+              multi: Type.Optional(
+                Type.Boolean({ description: "Allow multiple selections" }),
+              ),
+              recommended: Type.Optional(
+                Type.Number({ description: "Index of recommended option" }),
+              ),
+            }),
+            { description: "Questions to ask the user (required for structured mode)" },
+          ),
         ),
       }),
       execute: async (
@@ -813,13 +1071,39 @@ export function createAgenticToolDefinitions(
             "Not in interactive mode or no askUserQuestionHandler provided.",
           );
         }
+        const mode = (params.mode as string) ?? "structured";
+
+        if (mode === "simple") {
+          const questionText = params.question as string | undefined;
+          if (!questionText) {
+            return errorResult("Error: 'question' param is required when mode='simple'.");
+          }
+          const mapped = {
+            questions: [{
+              id: "_simple",
+              text: questionText,
+              options: undefined,
+              allowMultiple: false,
+              recommendedIndex: undefined,
+            }],
+          };
+          const response = await options.askUserQuestionHandler(mapped);
+          const answers = (response as { answers?: Array<{ answer?: string }> })?.answers;
+          const answer = answers?.[0]?.answer ?? "";
+          return ok(answer);
+        }
+
+        // Structured mode
         const questions = params.questions as Array<{
           id: string;
           question: string;
           options?: Array<{ label: string }>;
           multi?: boolean;
           recommended?: number;
-        }>;
+        }> | undefined;
+        if (!questions) {
+          return errorResult("Error: 'questions' param is required when mode='structured'.");
+        }
         // Map to AskUserQuestion schema
         const mapped = {
           questions: questions.map((q) => ({
@@ -1182,6 +1466,395 @@ export function createAgenticToolDefinitions(
         }
       },
     }),
+
+    // -----------------------------------------------------------------------
+    // config — runtime configuration tool (GAP-TOOLS-033)
+    // -----------------------------------------------------------------------
+    wrap({
+      name: "config",
+      label: "Runtime Config",
+      description:
+        "Read and modify babysitter configuration at runtime. " +
+        "Supports get/set/list/reset actions for standard config keys " +
+        "(maxIterations, timeout, logLevel, etc.), model/provider selection, " +
+        "and compression settings. Changes are run-scoped by default.",
+      parameters: Type.Object({
+        action: Type.Union([
+          Type.Literal("get"),
+          Type.Literal("set"),
+          Type.Literal("list"),
+          Type.Literal("reset"),
+        ], { description: "Action to perform: get, set, list, or reset" }),
+        key: Type.Optional(
+          Type.String({ description: "Config key path (dot notation for nested, e.g. 'compression.enabled')" }),
+        ),
+        value: Type.Optional(
+          Type.Unknown({ description: "New value for set action" }),
+        ),
+        scope: Type.Optional(
+          Type.Union([Type.Literal("run"), Type.Literal("global")], {
+            description: "Scope: 'run' (default, in-memory) or 'global' (env vars)",
+          }),
+        ),
+      }),
+      execute: (_toolCallId, params) => {
+        const action = params.action as string | undefined;
+        if (!action) {
+          return errorResult("'action' parameter is required (get, set, list, reset).");
+        }
+
+        const key = params.key as string | undefined;
+        const value = params.value;
+        const scope = (params.scope as string) ?? "run";
+
+        switch (action) {
+          case "get": {
+            if (!key) {
+              // Return full merged config
+              const cfg = getConfig();
+              const merged: Record<string, unknown> = { ...cfg };
+              // Add extended keys
+              for (const ek of EXTENDED_CONFIG_KEYS) {
+                merged[ek] = getConfigValue(ek);
+              }
+              // Add run-scoped overrides
+              for (const [k, v] of _runScopedConfig) {
+                merged[k] = v;
+              }
+              return jsonResult(merged);
+            }
+            if (!isValidConfigKey(key)) {
+              return errorResult(`Error: Unknown config key '${key}'.`);
+            }
+            return jsonResult({ key, value: getConfigValue(key) });
+          }
+
+          case "set": {
+            if (!key) {
+              return errorResult("Error: 'key' parameter is required for set action.");
+            }
+            if (value === undefined) {
+              return errorResult("Error: 'value' parameter is required for set action.");
+            }
+            if (!isValidConfigKey(key)) {
+              return errorResult(`Error: Unknown config key '${key}'.`);
+            }
+            // Type validation
+            const typeError = validateConfigValue(key, value);
+            if (typeError) {
+              return errorResult(`Error: ${typeError}`);
+            }
+
+            if (scope === "global") {
+              // Set env var for standard keys
+              const envKey = CONFIG_KEY_TO_ENV[key];
+              if (envKey) {
+                process.env[envKey] = String(value);
+              } else {
+                // For extended/compression keys, store as BABYSITTER_ env var
+                const envName = "BABYSITTER_" + key.replace(/\./g, "_").toUpperCase();
+                process.env[envName] = String(value);
+              }
+            }
+
+            // Always store in run-scoped map too
+            _runScopedConfig.set(key, value);
+            return ok(`Set '${key}' to ${JSON.stringify(value)} (scope: ${scope}).`);
+          }
+
+          case "list": {
+            const entries: Record<string, { current: unknown; default: unknown }> = {};
+            // Standard keys
+            for (const k of BABYSITTER_CONFIG_KEYS) {
+              entries[k] = {
+                current: getConfigValue(k),
+                default: getConfigDefault(k),
+              };
+            }
+            // Extended keys
+            for (const k of EXTENDED_CONFIG_KEYS) {
+              entries[k] = {
+                current: getConfigValue(k),
+                default: getConfigDefault(k),
+              };
+            }
+            // Include any run-scoped keys (compression.*, breakpoint.*) that have been set
+            for (const [k, v] of _runScopedConfig) {
+              if (!entries[k]) {
+                entries[k] = { current: v, default: undefined };
+              }
+            }
+            return jsonResult(entries);
+          }
+
+          case "reset": {
+            if (key) {
+              _runScopedConfig.delete(key);
+              return ok(`Reset '${key}' to default.`);
+            }
+            _runScopedConfig.clear();
+            return ok("Reset all config to defaults.");
+          }
+
+          default:
+            return errorResult(`Error: Unknown action '${action}'. Use get, set, list, or reset.`);
+        }
+      },
+    }),
+
+    // -----------------------------------------------------------------
+    // BACKGROUND PROCESS TOOLS (GAP-TOOLS-036)
+    // -----------------------------------------------------------------
+    wrap({
+      name: "background_status",
+      label: "Background Task Status",
+      description:
+        "Query the status of a background task by its backgroundTaskId. Returns the task record including status, stdout, stderr, and exit code.",
+      parameters: Type.Object({
+        backgroundTaskId: Type.String({
+          description: "The backgroundTaskId returned when launching a background task",
+        }),
+      }),
+      execute: (
+        _toolCallId: string,
+        params: Record<string, unknown>,
+      ): ToolResult => {
+        const registry = getBackgroundRegistry(options.maxBackgroundProcesses);
+        const id = String(params.backgroundTaskId);
+        const record = registry.get(id);
+        if (!record) {
+          return errorResult(`Background task not found: ${id}`);
+        }
+        return jsonResult(record);
+      },
+    }),
+
+    wrap({
+      name: "background_list",
+      label: "List Background Tasks",
+      description:
+        "List all tracked background tasks with their current status.",
+      parameters: Type.Object({}),
+      execute: (
+        _toolCallId: string,
+        _params: Record<string, unknown>,
+      ): ToolResult => {
+        const registry = getBackgroundRegistry(options.maxBackgroundProcesses);
+        const all = registry.list();
+        return jsonResult({ tasks: all });
+      },
+    }),
+
+    // -----------------------------------------------------------------
+    // TOOL DISCOVERY (GAP-TOOLS-034)
+    // -----------------------------------------------------------------
+    wrap({
+      name: "tool_search",
+      label: "Search Tools",
+      description:
+        "Search available tools by name or description. Returns lightweight tier-1 entries (name, description, source). Use tool_fetch to get full schema for a specific tool.",
+      parameters: Type.Object({
+        query: Type.String({ description: "Search query (matched against tool names and descriptions)" }),
+        max_results: Type.Optional(Type.Number({ description: "Maximum results to return (default 20)" })),
+      }),
+      execute: (
+        _toolCallId: string,
+        params: Record<string, unknown>,
+      ): ToolResult => {
+        const registry = options.deferredToolRegistry;
+        if (!registry) {
+          return errorResult("Tool search is not available — no deferred tool registry configured.");
+        }
+        const query = String(params.query ?? "");
+        const maxResults = typeof params.max_results === "number" ? params.max_results : 20;
+        const results = registry.searchTools(query, maxResults);
+        return jsonResult({
+          query,
+          resultCount: results.length,
+          tools: results.map((t) => ({
+            name: t.name,
+            description: t.description,
+            source: t.source,
+            sourceQualifier: t.sourceQualifier,
+          })),
+        });
+      },
+    }),
+    wrap({
+      name: "tool_fetch",
+      label: "Fetch Tool Schema",
+      description:
+        "Fetch the full JSON Schema for a tool by name. Returns the complete input/output schema needed to invoke the tool.",
+      parameters: Type.Object({
+        name: Type.String({ description: "Tool name to fetch schema for" }),
+        source: Type.Optional(Type.String({ description: "Source filter: builtin, mcp, plugin, custom" })),
+        source_qualifier: Type.Optional(Type.String({ description: "Source qualifier (e.g. MCP server name)" })),
+      }),
+      execute: async (
+        _toolCallId: string,
+        params: Record<string, unknown>,
+      ): Promise<ToolResult> => {
+        const registry = options.deferredToolRegistry;
+        if (!registry) {
+          return errorResult("Tool fetch is not available — no deferred tool registry configured.");
+        }
+        const toolName = String(params.name ?? "");
+        const VALID_SOURCES = new Set(["builtin", "mcp", "plugin", "custom"]);
+        const rawSource = typeof params.source === "string" ? params.source : undefined;
+        if (rawSource && !VALID_SOURCES.has(rawSource)) {
+          return errorResult(`Invalid source "${rawSource}". Valid sources: builtin, mcp, plugin, custom.`);
+        }
+        const source = rawSource as "builtin" | "mcp" | "plugin" | "custom" | undefined;
+        const sourceQualifier = typeof params.source_qualifier === "string" ? params.source_qualifier : undefined;
+        const resolved = await registry.fetchSchema(
+          toolName,
+          source,
+          sourceQualifier,
+        );
+        if (!resolved) {
+          return errorResult(`Tool "${toolName}" not found or schema could not be loaded.`);
+        }
+        return jsonResult({
+          name: resolved.name,
+          description: resolved.description,
+          source: resolved.source,
+          sourceQualifier: resolved.sourceQualifier,
+          inputSchema: resolved.schema.inputSchema,
+          outputSchema: resolved.schema.outputSchema,
+        });
+      },
+    }),
+
+    // -----------------------------------------------------------------
+    // WEB SEARCH (GAP-TOOLS-008)
+    // -----------------------------------------------------------------
+    wrap({
+      name: "web_search",
+      label: "Web Search",
+      description:
+        "Search the web using a query string. Returns search result snippets. Supports domain whitelisting/blacklisting.",
+      parameters: Type.Object({
+        query: Type.String({ description: "Search query" }),
+        max_results: Type.Optional(Type.Number({ description: "Maximum results to return (default 10)" })),
+        domains: Type.Optional(Type.Array(Type.String(), { description: "Domain whitelist (only return results from these domains)" })),
+        exclude_domains: Type.Optional(Type.Array(Type.String(), { description: "Domain blacklist (exclude results from these domains)" })),
+      }),
+      execute: async (
+        _toolCallId: string,
+        params: Record<string, unknown>,
+      ): Promise<ToolResult> => {
+        const query = String(params.query ?? "");
+        if (!query.trim()) {
+          return errorResult("Search query is required.");
+        }
+        const maxResults = typeof params.max_results === "number" ? params.max_results : 10;
+        const domains = Array.isArray(params.domains) ? params.domains.filter((d): d is string => typeof d === "string") : undefined;
+        const excludeDomains = Array.isArray(params.exclude_domains) ? params.exclude_domains.filter((d): d is string => typeof d === "string") : undefined;
+
+        // Build search URL with domain filters
+        let searchQuery = query;
+        if (domains && domains.length > 0) {
+          searchQuery += " " + domains.map(d => `site:${d}`).join(" OR ");
+        }
+        if (excludeDomains && excludeDomains.length > 0) {
+          searchQuery += " " + excludeDomains.map(d => `-site:${d}`).join(" ");
+        }
+
+        try {
+          // Use DuckDuckGo HTML API for search (no API key needed)
+          const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(searchQuery)}`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), DEFAULT_SEARCH_TIMEOUT);
+          try {
+            const response = await globalThis.fetch(searchUrl, {
+              signal: controller.signal,
+              headers: { "User-Agent": "babysitter-sdk/web-search" },
+            });
+            const html = await response.text();
+            const results = parseSearchResults(html, maxResults);
+            return jsonResult({ query, resultCount: results.length, results });
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return errorResult(`Web search failed: ${message}`);
+        }
+      },
+    }),
+
+    // -----------------------------------------------------------------
+    // FETCH CONTENT PROCESSING (GAP-TOOLS-037)
+    // -----------------------------------------------------------------
+    wrap({
+      name: "fetch_process",
+      label: "Fetch and Process Content",
+      description:
+        "Fetch a URL and process the content to extract relevant information, reducing token usage. Extracts text content, removes boilerplate, and optionally filters by a prompt.",
+      parameters: Type.Object({
+        url: Type.String({ description: "URL to fetch and process" }),
+        prompt: Type.Optional(Type.String({ description: "Focus prompt — extract only content relevant to this query" })),
+        max_length: Type.Optional(Type.Number({ description: "Maximum output length in characters (default 10000)" })),
+        format: Type.Optional(Type.Union([Type.Literal("text"), Type.Literal("markdown"), Type.Literal("summary")], {
+          description: "Output format: text (plain extracted text), markdown (preserve structure), summary (key points only). Default: text",
+        })),
+      }),
+      execute: async (
+        _toolCallId: string,
+        params: Record<string, unknown>,
+      ): Promise<ToolResult> => {
+        const url = String(params.url ?? "");
+        if (!url.trim()) {
+          return errorResult("URL is required.");
+        }
+        const maxLength = typeof params.max_length === "number" ? params.max_length : 10_000;
+        const format = typeof params.format === "string" ? params.format : "text";
+        const prompt = typeof params.prompt === "string" ? params.prompt : undefined;
+
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), DEFAULT_SEARCH_TIMEOUT);
+          try {
+            const response = await globalThis.fetch(url, {
+              signal: controller.signal,
+              headers: { "User-Agent": "babysitter-sdk/fetch-process" },
+            });
+            const contentType = response.headers.get("content-type") ?? "";
+            const rawText = await response.text();
+
+            let processed: string;
+            if (contentType.includes("text/html")) {
+              processed = extractTextFromHtml(rawText, format);
+            } else {
+              processed = rawText;
+            }
+
+            // Apply prompt-based filtering if provided
+            if (prompt) {
+              processed = filterByRelevance(processed, prompt);
+            }
+
+            // Truncate to max length
+            if (processed.length > maxLength) {
+              processed = processed.slice(0, maxLength) + "\n... (truncated)";
+            }
+
+            return jsonResult({
+              url,
+              contentType,
+              format,
+              length: processed.length,
+              content: processed,
+            });
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return errorResult(`Fetch processing failed: ${message}`);
+        }
+      },
+    }),
   ];
 
   return tools;
@@ -1209,6 +1882,16 @@ interface PuppeteerBrowser {
 
 let browserInstance: PuppeteerBrowser | null = null;
 
+/** Module-level background process registry (shared across tool invocations). */
+let _backgroundRegistry: BackgroundProcessRegistry | null = null;
+
+function getBackgroundRegistry(maxConcurrent?: number): BackgroundProcessRegistry {
+  if (!_backgroundRegistry) {
+    _backgroundRegistry = new BackgroundProcessRegistry({ maxConcurrent });
+  }
+  return _backgroundRegistry;
+}
+
 /** Minimal Jupyter notebook JSON structure. */
 interface NotebookJson {
   cells: NotebookCell[];
@@ -1221,4 +1904,139 @@ interface NotebookCell {
   metadata: Record<string, unknown>;
   outputs?: unknown[];
   [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
+// Web search helpers (GAP-TOOLS-008)
+// ---------------------------------------------------------------------------
+
+interface SearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+/** Parse DuckDuckGo HTML search results into structured results. Exported for testing. */
+export function parseSearchResults(html: string, maxResults: number): SearchResult[] {
+  const results: SearchResult[] = [];
+  // DuckDuckGo HTML results are in <a class="result__a"> with <a class="result__snippet">
+  const resultPattern = /<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+  const snippetPattern = /<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+
+  const urls: string[] = [];
+  const titles: string[] = [];
+  const snippets: string[] = [];
+
+  let match: RegExpExecArray | null;
+  while ((match = resultPattern.exec(html)) !== null) {
+    try {
+      const rawUrl = match[1].replace(/.*uddg=/, "").split("&")[0] ?? match[1];
+      urls.push(decodeURIComponent(rawUrl));
+    } catch {
+      urls.push(match[1]);
+    }
+    titles.push(stripHtmlTags(match[2]).trim());
+  }
+
+  while ((match = snippetPattern.exec(html)) !== null) {
+    snippets.push(stripHtmlTags(match[1]).trim());
+  }
+
+  for (let i = 0; i < Math.min(urls.length, maxResults); i++) {
+    results.push({
+      title: titles[i] ?? "",
+      url: urls[i] ?? "",
+      snippet: snippets[i] ?? "",
+    });
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// Fetch content processing helpers (GAP-TOOLS-037)
+// ---------------------------------------------------------------------------
+
+/** Strip HTML tags and decode common entities. Exported for testing. */
+export function stripHtmlTags(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&mdash;/g, "\u2014")
+    .replace(/&ndash;/g, "\u2013")
+    .replace(/&hellip;/g, "\u2026")
+    .replace(/&copy;/g, "\u00A9")
+    .replace(/&#(\d+);/g, (_m: string, code: string) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m: string, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+/** Extract meaningful text from HTML, removing boilerplate. Exported for testing. */
+export function extractTextFromHtml(html: string, format: string): string {
+  // Remove scripts, styles, nav, footer, header elements
+  let cleaned = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+    .replace(/<header[\s\S]*?<\/header>/gi, "")
+    .replace(/<aside[\s\S]*?<\/aside>/gi, "");
+
+  if (format === "markdown") {
+    // Convert headings
+    cleaned = cleaned.replace(/<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi, (_m: string, level: string, content: string) => {
+      return "\n" + "#".repeat(Number(level)) + " " + stripHtmlTags(content).trim() + "\n";
+    });
+    // Convert paragraphs
+    cleaned = cleaned.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, (_m: string, content: string) => {
+      return "\n" + stripHtmlTags(content).trim() + "\n";
+    });
+    // Convert list items
+    cleaned = cleaned.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, (_m: string, content: string) => {
+      return "- " + stripHtmlTags(content).trim() + "\n";
+    });
+    // Convert code blocks
+    cleaned = cleaned.replace(/<pre[^>]*>([\s\S]*?)<\/pre>/gi, (_m: string, content: string) => {
+      return "\n```\n" + stripHtmlTags(content).trim() + "\n```\n";
+    });
+    // Convert inline code
+    cleaned = cleaned.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, (_m: string, content: string) => {
+      return "`" + stripHtmlTags(content).trim() + "`";
+    });
+    // Strip remaining tags
+    cleaned = stripHtmlTags(cleaned);
+  } else {
+    cleaned = stripHtmlTags(cleaned);
+  }
+
+  // Normalize whitespace
+  cleaned = cleaned.replace(/\n{3,}/g, "\n\n").replace(/[ \t]+/g, " ").trim();
+  return cleaned;
+}
+
+/**
+ * Filter content by relevance to a prompt.
+ * Splits content into paragraphs and keeps those containing query terms.
+ */
+export function filterByRelevance(content: string, prompt: string): string {
+  const terms = prompt.toLowerCase().split(/\s+/).filter(t => t.length > 1);
+  if (terms.length === 0) return content;
+
+  const paragraphs = content.split(/\n\n+/);
+  const scored = paragraphs.map(p => {
+    const lower = p.toLowerCase();
+    const score = terms.reduce((s, t) => s + (lower.includes(t) ? 1 : 0), 0);
+    return { text: p, score };
+  });
+
+  const relevant = scored.filter((p) => p.score > 0);
+
+  // If nothing matched, return original content (query terms may be too specific)
+  if (relevant.length === 0) return content;
+
+  return relevant.map(p => p.text).join("\n\n");
 }

@@ -32,7 +32,7 @@ function main() {
   const args = parseArgs(process.argv);
   const packageRoot = path.resolve(process.env.BABYSITTER_PACKAGE_ROOT || path.join(__dirname, '..'));
   const workspaceRoot = args.workspace;
-  const workspacePluginRoot = path.join(workspaceRoot, 'plugins', 'babysitter');
+  const workspacePluginRoot = path.join(workspaceRoot, '.agents', 'plugins', 'babysitter');
   const workspaceMarketplacePath = path.join(workspaceRoot, '.agents', 'plugins', 'marketplace.json');
   const workspaceConfigPath = path.join(workspaceRoot, '.codex', 'config.toml');
 
@@ -81,6 +81,7 @@ function main() {
 
   warnWindowsHooks();
   console.log('[team-install] complete');
+  console.log('[team-install] If Codex was already open, start a new thread before expecting `babysitter:*` skills such as `$babysitter:babysit` or `$babysitter:call` to appear.');
 }
 
 main();

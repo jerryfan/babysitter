@@ -3,7 +3,7 @@
  *
  * Centralizes all GitHub Copilot CLI-specific behaviors:
  *   - Session ID resolution (hook stdin JSON with `timestamp` and `cwd`)
- *   - State directory conventions (.a5c/state/ by default)
+ *   - State directory conventions (~/.a5c/state/ by default)
  *   - Plugin root resolution (COPILOT_PLUGIN_ROOT)
  *   - Session binding (run:create → state file with run association)
  *   - Session-end hook handler (cleanup on session termination)
@@ -56,7 +56,26 @@ import { HarnessCapability } from "./types";
 import type { PromptContext } from "../prompts/types";
 import { createGithubCopilotContext } from "../prompts/context";
 import { installCliViaNpm } from "./installSupport";
-import { getGlobalStateDir } from "../config";
+import { getGlobalLogDir, normalizeSessionStateDir } from "../config";
+import { readSessionMarker, writeSessionMarker } from "./sessionMarker";
+
+/**
+ * Append BABYSITTER_SESSION_ID to a Copilot env file. Append-only matches the
+ * harness's shell-sourcing semantics: the file is sourced in order and the
+ * last export wins. Resolvers use a last-match regex, mirroring that.
+ *
+ * Do NOT rewrite or rename-swap the file: the harness may retain a cached
+ * handle to the original inode, and rewriting breaks the sourcing contract.
+ *
+ * Local duplicate of the claudeCode helper — kept local rather than shared to
+ * allow per-harness divergence. Exported for targeted testing.
+ */
+export function setBabysitterSessionIdInCopilotEnvFile(
+  envFile: string,
+  sessionId: string,
+): void {
+  appendFileSync(envFile, `export BABYSITTER_SESSION_ID="${sessionId}"\n`);
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -76,7 +95,7 @@ interface HookLogger {
 }
 
 function createHookLogger(hookName: string): HookLogger {
-  const logDir = process.env.BABYSITTER_LOG_DIR || ".a5c/logs";
+  const logDir = getGlobalLogDir();
   const logFile = logDir ? path.join(logDir, `${hookName}.log`) : null;
   const context: Record<string, string> = {};
 
@@ -216,8 +235,9 @@ function resolveStateDirInternal(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  return getGlobalStateDir();
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -240,26 +260,54 @@ function resolveSessionIdInternal(parsed: { sessionId?: string }): string | unde
   // 1. Explicit arg (highest priority)
   if (parsed.sessionId) return parsed.sessionId;
 
-  // 2. Cross-harness standard env var (written by session-start hook to env file)
-  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+  const trustEnv = process.env.BABYSITTER_TRUST_ENV_SESSION === "1";
 
-  // 3. Env file (if COPILOT_ENV_FILE or CLAUDE_ENV_FILE exists)
+  // Legacy escape hatch: env-var-first pre-fix behavior.
+  if (trustEnv) {
+    if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+    const envFile = process.env.COPILOT_ENV_FILE || process.env.CLAUDE_ENV_FILE;
+    if (envFile) {
+      try {
+        const content = readFileSync(envFile, "utf-8");
+        const match = content.match(
+          /(?:^|\n)\s*(?:export\s+)?BABYSITTER_SESSION_ID="([^"]+)"/,
+        );
+        if (match?.[1]) return match[1];
+      } catch {
+        // fall through
+      }
+    }
+    if (process.env.COPILOT_SESSION_ID) return process.env.COPILOT_SESSION_ID;
+    return undefined;
+  }
+
+  // 2. PID-scoped marker (authoritative per live copilot ancestor PID)
+  const fromMarker = readSessionMarker("github-copilot");
+  if (fromMarker) return fromMarker;
+
+  // 3. Env file: use LAST-match regex so accumulated stale
+  //    `export BABYSITTER_SESSION_ID=...` lines don't shadow the most recent
+  //    write.
   const envFile = process.env.COPILOT_ENV_FILE || process.env.CLAUDE_ENV_FILE;
   if (envFile) {
     try {
       const content = readFileSync(envFile, "utf-8");
-      const match = content.match(
-        /(?:^|\n)\s*(?:export\s+)?BABYSITTER_SESSION_ID="([^"]+)"/,
-      );
-      return match?.[1] || undefined;
+      const matches = [
+        ...content.matchAll(/export BABYSITTER_SESSION_ID="([^"]+)"/g),
+      ];
+      const last = matches.at(-1)?.[1];
+      if (last) return last;
     } catch {
       // Fall through
     }
   }
 
-  // 4. Session ID from hook stdin JSON is resolved at hook handler time, not here.
-  //    Copilot CLI hooks receive stdin JSON with `timestamp` and `cwd` fields;
-  //    session_id may be available if custom hook config passes it.
+  // 4. Copilot-native env var (if the CLI injects it).
+  if (process.env.COPILOT_SESSION_ID) return process.env.COPILOT_SESSION_ID;
+
+  // 5. Cross-harness standard (potentially stale, last resort).
+  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+
   return undefined;
 }
 
@@ -303,10 +351,12 @@ async function handleSessionEndHookImpl(
   const hookInput = parseHookInput(rawInput) as CopilotHookInput;
   log.info("Hook input received");
 
-  // 2. Resolve session ID from hook input (stdin JSON) or cross-harness env var
+  // 2. Resolve session ID from hook input (stdin JSON) or via internal
+  //    resolver (pid-marker → env-file last-match → COPILOT_SESSION_ID →
+  //    BABYSITTER_SESSION_ID).
   const sessionId =
     safeStr(hookInput as Record<string, unknown>, "session_id") ||
-    process.env.BABYSITTER_SESSION_ID ||
+    resolveSessionIdInternal({}) ||
     "";
 
   if (!sessionId) {
@@ -415,10 +465,10 @@ async function handleSessionStartHookImpl(
 
   const hookInput = parseHookInput(rawInput) as CopilotHookInput;
 
-  // 2. Resolve session ID
+  // 2. Resolve session ID (stdin JSON first, then internal resolver)
   const sessionId =
     safeStr(hookInput as Record<string, unknown>, "session_id") ||
-    process.env.BABYSITTER_SESSION_ID ||
+    resolveSessionIdInternal({}) ||
     "";
 
   if (!sessionId) {
@@ -430,14 +480,21 @@ async function handleSessionStartHookImpl(
   log.setContext("session", sessionId);
   log.info(`Session ID: ${sessionId}`);
 
-  // 3. Persist BABYSITTER_SESSION_ID to env file (COPILOT_ENV_FILE or CLAUDE_ENV_FILE)
+  // 2b. Persist PID-scoped marker so descendants can resolve session ID on
+  //     platforms / shells where env-file sourcing isn't reliable.
+  try {
+    writeSessionMarker("github-copilot", sessionId);
+  } catch {
+    // Non-fatal
+  }
+
+  // 3. Persist BABYSITTER_SESSION_ID to env file (COPILOT_ENV_FILE or CLAUDE_ENV_FILE).
+  //    Append-only: the harness sources the file in order before each tool call
+  //    and the last export wins. The resolver uses a last-match regex.
   const envFile = process.env.COPILOT_ENV_FILE || process.env.CLAUDE_ENV_FILE;
   if (envFile) {
     try {
-      appendFileSync(
-        envFile,
-        `export BABYSITTER_SESSION_ID="${sessionId}"\n`,
-      );
+      setBabysitterSessionIdInCopilotEnvFile(envFile, sessionId);
     } catch {
       if (verbose) {
         process.stderr.write(
@@ -460,6 +517,7 @@ async function handleSessionStartHookImpl(
         iteration: 1,
         maxIterations: 256,
         runId: "",
+        runIds: [],
         startedAt: nowTs,
         lastIterationAt: nowTs,
         iterationTimes: [],
@@ -542,6 +600,7 @@ async function bindSessionImpl(
     iteration: 1,
     maxIterations,
     runId,
+    runIds: [],
     startedAt: nowTs,
     lastIterationAt: nowTs,
     iterationTimes: [],

@@ -9,7 +9,6 @@ const {
   getCodexHome,
   getHomeMarketplacePath,
   getHomePluginRoot,
-  installCodexSurface,
   mergeCodexConfigFile,
   warnWindowsHooks,
 } = require('./install-shared');
@@ -27,7 +26,6 @@ function main() {
     copyPluginBundle(PACKAGE_ROOT, pluginRoot);
     ensureMarketplaceEntry(marketplacePath, pluginRoot);
     mergeCodexConfigFile(path.join(codexHome, 'config.toml'));
-    installCodexSurface(PACKAGE_ROOT, codexHome);
 
     const active = ensureGlobalProcessLibrary(PACKAGE_ROOT);
     console.log(`[babysitter]   marketplace: ${marketplacePath}`);
@@ -38,7 +36,8 @@ function main() {
     console.log(`[babysitter]   process library state: ${active.stateFile}`);
     warnWindowsHooks();
     console.log('[babysitter] Installation complete!');
-    console.log('[babysitter] Restart Codex to pick up the installed plugin and config changes.');
+    console.log('[babysitter] Restart Codex to pick up the installed plugin and config changes, then run Codex and install Babysitter from `/plugins`.');
+    console.log('[babysitter] If Codex was already open, start a new thread after install before expecting `babysitter:*` skills such as `$babysitter:babysit` or `$babysitter:call` to appear.');
   } catch (err) {
     console.error(`[babysitter] Failed to install plugin: ${err.message}`);
     process.exitCode = 1;

@@ -4,7 +4,7 @@
  * Centralizes all Cursor-specific behaviors:
  *   - Session ID resolution (conversation_id from hook stdin JSON, persisted
  *     by sessionStart hook to a state file)
- *   - State directory conventions (.a5c/state/ by default)
+ *   - State directory conventions (~/.a5c/state/ by default)
  *   - Plugin root resolution (CURSOR_PLUGIN_ROOT env var)
  *   - Session binding (run:create → state file with run association)
  *   - Stop hook handler (approve/block via followup_message auto-continue)
@@ -17,8 +17,13 @@
  *   - Output: JSON via stdout
  *   - Stop hook: return { followup_message: "..." } to auto-continue (loop_limit
  *     default 5, null for unlimited). Return {} to allow exit.
- *   - Hook types (in headless CLI): sessionStart, stop, postToolUse,
- *     afterFileEdit, afterShellExecution (work in CLI)
+ *   - Hook types (in headless CLI): sessionStart, stop, prompt, postToolUse,
+ *     afterFileEdit, afterShellExecution. Stop hook in CLI was officially
+ *     added in the Jan 16 2026 release, but community reports (forum
+ *     #148511, last verified Apr 2026) indicate intermittent firing
+ *     reliability — the orchestration loop may stall if Cursor skips a
+ *     stop callback. Verify hook activity via `~/.cursor/logs/` if loops
+ *     fail to advance.
  *   - NOT in headless: afterAgentResponse, afterAgentThought (IDE only)
  *
  * Session ID:
@@ -62,7 +67,8 @@ import type {
 import { HarnessCapability } from "./types";
 import type { PromptContext } from "../prompts/types";
 import { createCursorContext } from "../prompts/context";
-import { getGlobalStateDir } from "../config";
+import { getGlobalLogDir, normalizeSessionStateDir } from "../config";
+import { readSessionMarker, writeSessionMarker } from "./sessionMarker";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -82,7 +88,7 @@ interface HookLogger {
 }
 
 function createHookLogger(hookName: string): HookLogger {
-  const logDir = process.env.BABYSITTER_LOG_DIR || ".a5c/logs";
+  const logDir = getGlobalLogDir();
   const logFile = logDir ? path.join(logDir, `${hookName}.log`) : null;
   const context: Record<string, string> = {};
 
@@ -259,8 +265,9 @@ function resolveStateDirInternal(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  return getGlobalStateDir();
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +668,13 @@ async function handleSessionStartHookImpl(
   log.setContext("session", sessionId);
   log.info(`Session ID: ${sessionId}`);
 
+  // 2b. Persist PID-scoped marker so descendants can resolve session ID.
+  try {
+    writeSessionMarker("cursor", sessionId);
+  } catch {
+    // Non-fatal
+  }
+
   // 3. Resolve state directory and create baseline session file
   const stateDir = resolveStateDirInternal(args);
   log.info(`Resolved stateDir: ${stateDir}`);
@@ -674,6 +688,7 @@ async function handleSessionStartHookImpl(
         iteration: 1,
         maxIterations: 256,
         runId: "",
+        runIds: [],
         startedAt: nowTs,
         lastIterationAt: nowTs,
         iterationTimes: [],
@@ -756,6 +771,7 @@ async function bindSessionImpl(
     iteration: 1,
     maxIterations,
     runId,
+    runIds: [],
     startedAt: nowTs,
     lastIterationAt: nowTs,
     iterationTimes: [],
@@ -889,7 +905,17 @@ export function createCursorAdapter(): HarnessAdapter {
     },
 
     resolveSessionId(parsed: { sessionId?: string }): string | undefined {
+      // stdin/conversation_id is the true per-request source, but it isn't
+      // available at env-resolution time — callers pass parsed.sessionId when
+      // they do have it. Honor that first.
       if (parsed.sessionId) return parsed.sessionId;
+      const trustEnv = process.env.BABYSITTER_TRUST_ENV_SESSION === "1";
+      if (trustEnv) {
+        if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+        return undefined;
+      }
+      const fromMarker = readSessionMarker("cursor");
+      if (fromMarker) return fromMarker;
       // Cursor has no env file mechanism, but BABYSITTER_SESSION_ID may be
       // set externally or by a wrapper script.
       if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;

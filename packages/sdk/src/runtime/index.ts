@@ -1,6 +1,6 @@
 export { createRun } from "./createRun";
 export { orchestrateIteration } from "./orchestrateIteration";
-export { commitEffectResult } from "./commitEffectResult";
+export { commitEffectResult, commitEffectCancellation } from "./commitEffectResult";
 export { createReplayEngine } from "./replay";
 export {
   createProcessContext,
@@ -37,5 +37,21 @@ export type {
   DerivedEffectSummary,
 } from "./replay";
 export { hashInvocationKey } from "./invocation";
-export { EffectRequestedError, EffectPendingError, ParallelPendingError, RunFailedError } from "./exceptions";
+export { EffectRequestedError, EffectPendingError, EffectCancelledError, ParallelPendingError, RunFailedError } from "./exceptions";
 export { replaySchemaVersion } from "./constants";
+export {
+  definePipeline,
+  buildStepInputs,
+  validatePipelineDefinition,
+  type PipelineStepDefinition,
+  type PipelineDefinition,
+  type PipelineStepResult,
+  type PipelineResult,
+  type PipelineValidationResult,
+} from "./processPipeline";
+export {
+  applyStrategy,
+  type ParallelStrategyName,
+  type ParallelStrategyOptions,
+  type ParallelStrategyResult,
+} from "./parallelStrategies";

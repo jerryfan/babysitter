@@ -26,6 +26,24 @@ const sampleTask: DefinedTask<{ value: number }, number> = {
   }),
 };
 
+const shellTask: DefinedTask<{ command: string }, {
+  success: false;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  error: string;
+}> = {
+  id: "shell-task",
+  build: async (args) => ({
+    kind: "shell",
+    title: "verify shell task",
+    shell: {
+      command: args.command,
+      expectedExitCode: 0,
+    },
+  }),
+};
+
 let tmpRoot: string;
 
 beforeEach(async () => {
@@ -177,7 +195,7 @@ describe("runTaskIntrinsic", () => {
     ).resolves.toEqual(largeValue);
   });
 
-  test("throws when a resolved ok effect is missing its result payload", async () => {
+  test("returns null when a resolved ok effect is missing its result payload", async () => {
     const { runDir, runId } = await createRun("run-undefined-result");
     const context = await buildContext(runDir, runId);
 
@@ -221,13 +239,105 @@ describe("runTaskIntrinsic", () => {
     });
 
     const replayCtx = await buildContext(runDir, runId);
+    // Missing result payload returns null gracefully instead of crashing
     await expect(
       runTaskIntrinsic({
         task: sampleTask,
         args: { value: 5 },
         context: replayCtx,
       })
-    ).rejects.toThrow(RunFailedError);
+    ).resolves.toBeNull();
+  });
+
+  test("returns success:false shell result without throwing", async () => {
+    const { runDir, runId } = await createRun("run-shell-fail");
+    const context = await buildContext(runDir, runId);
+
+    let effectId = "";
+    try {
+      await runTaskIntrinsic({
+        task: sampleTask,
+        args: { value: 7 },
+        context,
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(EffectRequestedError);
+      effectId = (error as EffectRequestedError).action.effectId;
+    }
+
+    // Simulate a shell task that failed but was posted as ok with structured failure value
+    const failureValue = {
+      success: false,
+      exitCode: 1,
+      stdout: "",
+      stderr: "SyntaxError: Invalid regular expression",
+      error: "Shell command exited with code 1: SyntaxError: Invalid regular expression",
+    };
+    await commitEffectResult({
+      runDir,
+      effectId,
+      result: { status: "ok", value: failureValue },
+    });
+
+    const replayCtx = await buildContext(runDir, runId);
+    // The process gets the failure value back instead of the run crashing
+    await expect(
+      runTaskIntrinsic({
+        task: sampleTask,
+        args: { value: 7 },
+        context: replayCtx,
+      })
+    ).resolves.toEqual(failureValue);
+  });
+
+  test("returns structured shell failures when a shell effect was committed with status:error", async () => {
+    const { runDir, runId } = await createRun("run-shell-resolved-error");
+    const context = await buildContext(runDir, runId);
+
+    let effectId = "";
+    try {
+      await runTaskIntrinsic({
+        task: shellTask,
+        args: { command: "npm test" },
+        context,
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(EffectRequestedError);
+      effectId = (error as EffectRequestedError).action.effectId;
+    }
+
+    await commitEffectResult({
+      runDir,
+      effectId,
+      result: {
+        status: "error",
+        error: {
+          name: "ShellCommandFailed",
+          message: "Shell command exited with code 2",
+          data: {
+            exitCode: 2,
+            stdout: "",
+            stderr: "tsc failed",
+          },
+        },
+        stderr: "tsc failed",
+      },
+    });
+
+    const replayCtx = await buildContext(runDir, runId);
+    await expect(
+      runTaskIntrinsic({
+        task: shellTask,
+        args: { command: "npm test" },
+        context: replayCtx,
+      })
+    ).resolves.toEqual({
+      success: false,
+      exitCode: 2,
+      stdout: "",
+      stderr: "tsc failed",
+      error: "Shell command exited with code 2",
+    });
   });
 
   test("provides TaskBuildContext metadata and records registry entries", async () => {

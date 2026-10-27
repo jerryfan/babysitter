@@ -11,7 +11,7 @@ import type {
 import { HarnessCapability as Cap } from "./types";
 import type { PromptContext } from "../prompts/types";
 import { createPiContext } from "../prompts/context";
-import { getGlobalStateDir } from "../config";
+import { normalizeSessionStateDir } from "../config";
 import {
   getCurrentTimestamp,
   getSessionFilePath,
@@ -25,6 +25,7 @@ import {
   installCliViaNpm,
   runPackageBinaryViaNpx,
 } from "./installSupport";
+import { writeSessionMarker, resolveSessionIdWithMarker } from "./sessionMarker";
 
 function resolvePiPluginRoot(
   args: { pluginRoot?: string } = {},
@@ -37,15 +38,13 @@ function resolvePiStateDir(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  return getGlobalStateDir();
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 function resolvePiSessionId(parsed: { sessionId?: string }): string | undefined {
-  if (parsed.sessionId) return parsed.sessionId;
-  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
-  if (process.env.PI_SESSION_ID) return process.env.PI_SESSION_ID;
-  return undefined;
+  return resolveSessionIdWithMarker("pi", parsed, ["PI_SESSION_ID"]);
 }
 
 async function bindPiSession(
@@ -86,6 +85,7 @@ async function bindPiSession(
     iteration: 1,
     maxIterations: opts.maxIterations ?? 256,
     runId: opts.runId,
+    runIds: [],
     startedAt: now,
     lastIterationAt: now,
     iterationTimes: [],
@@ -190,6 +190,17 @@ export function createPiAdapter(): HarnessAdapter {
     },
 
     handleSessionStartHook(_args: HookHandlerArgs): Promise<number> {
+      // Best-effort: persist PID-scoped marker so descendants can resolve the
+      // session ID independent of PI_SESSION_ID propagation.
+      const sessionId =
+        process.env.PI_SESSION_ID || process.env.BABYSITTER_SESSION_ID;
+      if (sessionId) {
+        try {
+          writeSessionMarker("pi", sessionId);
+        } catch {
+          // Non-fatal
+        }
+      }
       writeNoopHookResult();
       return Promise.resolve(0);
     },

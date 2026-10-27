@@ -15,12 +15,35 @@ import {
 } from "./paths";
 import { writeFileAtomic } from "./atomic";
 import { getClockIsoString } from "./clock";
+import { warnIfICloudDrivePath } from "./icloudWarning";
 
 const GITIGNORE_CONTENT = `state/\ntasks/*/artifacts/\nblobs/\norphaned/\n`;
 
+const MINIMAL_PACKAGE_JSON = JSON.stringify({ type: "module" }, null, 2) + "\n";
+
+/**
+ * Ensure the parent of runsRoot (typically `.a5c/`) has a package.json with
+ * `"type": "module"` so that process files can use ESM imports.  Only creates
+ * the file when it does not already exist -- never overwrites.
+ */
+async function ensureParentPackageJson(runsRoot: string): Promise<void> {
+  const parentDir = path.dirname(runsRoot);
+  const pkgPath = path.join(parentDir, "package.json");
+  try {
+    await fs.access(pkgPath);
+    // Already exists -- leave it alone.
+  } catch {
+    // Does not exist -- create a minimal ESM-enabling package.json.
+    await fs.mkdir(parentDir, { recursive: true });
+    await writeFileAtomic(pkgPath, MINIMAL_PACKAGE_JSON);
+  }
+}
+
 export async function createRunDir(options: CreateRunDirOptions) {
   const runDir = getRunDir(options.runsRoot, options.runId);
+  await warnIfICloudDrivePath(runDir);
   await fs.mkdir(runDir, { recursive: true });
+  await ensureParentPackageJson(options.runsRoot);
   await Promise.all([
     fs.mkdir(getJournalDir(runDir), { recursive: true }),
     fs.mkdir(getTasksDir(runDir), { recursive: true }),
@@ -45,6 +68,8 @@ export async function createRunDir(options: CreateRunDirOptions) {
     layoutVersion,
     createdAt,
     ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+    ...(options.inputSchema !== undefined ? { inputSchema: options.inputSchema } : {}),
+    ...(options.outputSchema !== undefined ? { outputSchema: options.outputSchema } : {}),
   };
   if (options.extraMetadata) {
     Object.assign(metadata, options.extraMetadata);
@@ -60,7 +85,7 @@ function resolveEntrypoint(options: CreateRunDirOptions): RunEntrypointMetadata 
   if (options.entrypoint?.importPath) {
     return {
       importPath: options.entrypoint.importPath,
-      exportName: options.entrypoint.exportName ?? "process",
+      exportName: options.entrypoint.exportName,
     };
   }
   const importPath = options.processPath ?? "./process.js";

@@ -22,8 +22,17 @@
 set -uo pipefail
 
 EXTENSION_PATH="${GEMINI_EXTENSION_PATH:-$(cd "$(dirname "$0")/.." && pwd)}"
+GLOBAL_ROOT="${BABYSITTER_GLOBAL_STATE_DIR:-$HOME/.a5c}"
+STATE_DIR="${BABYSITTER_STATE_DIR:-${GLOBAL_ROOT}/state}"
 
-LOG_DIR="${BABYSITTER_LOG_DIR:-${EXTENSION_PATH}/.a5c/logs}"
+
+
+if ! command -v babysitter &>/dev/null; then 
+  # No CLI available — exit 0 (no-op, proceed with original command)
+  exit 0
+fi
+
+LOG_DIR="${BABYSITTER_LOG_DIR:-${GLOBAL_ROOT}/logs}"
 LOG_FILE="$LOG_DIR/babysitter-after-agent-hook.log"
 mkdir -p "$LOG_DIR" 2>/dev/null
 
@@ -39,27 +48,6 @@ blog() {
 }
 
 blog "AfterAgent hook invoked"
-
-# ---------------------------------------------------------------------------
-# Resolve babysitter CLI
-# ---------------------------------------------------------------------------
-
-if ! command -v babysitter &>/dev/null; then
-  # Try user-local prefix (set by session-start hook)
-  if [ -x "$HOME/.local/bin/babysitter" ]; then
-    export PATH="$HOME/.local/bin:$PATH"
-  else
-    SDK_VERSION=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('${EXTENSION_PATH}/versions.json','utf8')).sdkVersion||'latest')}catch{console.log('latest')}" 2>/dev/null || echo "latest")
-    if [ -n "$SDK_VERSION" ]; then
-      babysitter() { npx -y "@a5c-ai/babysitter-sdk@${SDK_VERSION}" "$@"; }
-      export -f babysitter
-    else
-      # No CLI available at all — allow exit silently
-      echo '{}'
-      exit 0
-    fi
-  fi
-fi
 
 blog "babysitter CLI resolved"
 
@@ -83,7 +71,7 @@ RESULT=$(babysitter hook:run \
   --hook-type stop \
   --harness gemini-cli \
   --plugin-root "$EXTENSION_PATH" \
-  --state-dir ".a5c/state" \
+  --state-dir "${STATE_DIR}" \
   --json < "$INPUT_FILE" 2>>"$LOG_DIR/babysitter-after-agent-hook-stderr.log")
 EXIT_CODE=$?
 

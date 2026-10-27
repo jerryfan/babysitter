@@ -26,7 +26,7 @@ export function renderRunCreation(ctx: PromptContext): string {
       const flagName = part.startsWith('--') ? part : `--${part}`;
       const nameOnly = flagName.split(/\s/)[0];
       if (nameOnly === '--state-dir') {
-        requiredFlagsLines.push('- `--state-dir .a5c` -- required for honest workspace-local session state');
+        requiredFlagsLines.push('- `--state-dir <dir>` -- only when intentionally overriding the default global session state directory');
       } else if (nameOnly === '--plugin-root') {
         requiredFlagsLines.push(`- \`--plugin-root "${ctx.pluginRootVar}"\` -- plugin root for state resolution`);
       }
@@ -34,8 +34,8 @@ export function renderRunCreation(ctx: PromptContext): string {
   }
 
   const sessionIdNote = ctx.harness === 'codex'
-    ? `Do **not** pass \`--session-id\` explicitly inside a real ${ctx.harnessLabel} session. The ${ctx.harnessLabel}\nadapter auto-resolves the session/thread ID from environment variables. Only pass\n\`--session-id\` in out-of-band recovery flows.\n`
-    : '';
+    ? `Do **not** pass \`--session-id\` explicitly inside a real ${ctx.harnessLabel} session. The\nsession ID auto-resolves from the **PID-scoped session marker** written by the\nsession-start hook (authoritative), with the harness env file and\n\`BABYSITTER_SESSION_ID\` env var used only as last-resort fallbacks. Orchestrators\ncan verify the binding at any time via \`babysitter session:whoami --json\`. Only\npass \`--session-id\` in out-of-band recovery flows.\n`
+    : `The session ID auto-resolves from the **PID-scoped session marker** written by\nthe session-start hook (authoritative), with the harness env file and\n\`BABYSITTER_SESSION_ID\` env var used only as last-resort fallbacks. Orchestrators\ncan verify the binding at any time via \`babysitter session:whoami --json\`.\n`;
 
   const resumeFlagsLine = ctx.resumeFlags
     ? `\n  ${ctx.resumeFlags} \\`

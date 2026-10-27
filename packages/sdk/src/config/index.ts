@@ -34,7 +34,9 @@ export {
 
   // Functions
   getConfig,
+  getGlobalLogDir,
   getGlobalStateDir,
+  normalizeSessionStateDir,
   validateConfig,
   getDefaults,
   isValidLogLevel,

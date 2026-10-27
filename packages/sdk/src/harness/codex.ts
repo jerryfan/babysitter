@@ -9,7 +9,7 @@
 
 import * as path from "node:path";
 import { Readable } from "node:stream";
-import { getGlobalStateDir } from "../config";
+import { normalizeSessionStateDir } from "../config";
 import { createClaudeCodeAdapter } from "./claudeCode";
 import {
   getCurrentTimestamp,
@@ -34,6 +34,7 @@ import {
   isCodexPluginInstalled,
   runPackageBinaryViaNpx,
 } from "./installSupport";
+import { readSessionMarker, writeSessionMarker } from "./sessionMarker";
 
 function resolveCodexPluginRoot(
   args: { pluginRoot?: string } = {},
@@ -46,19 +47,34 @@ function resolveCodexStateDir(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  return getGlobalStateDir();
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 function resolveCodexSessionId(parsed: { sessionId?: string }): string | undefined {
   if (parsed.sessionId) return parsed.sessionId;
 
-  // Cross-harness standard
-  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+  const trustEnv = process.env.BABYSITTER_TRUST_ENV_SESSION === "1";
 
-  // Codex-native env vars (auto-injected by Codex CLI into all hooks)
+  // Legacy escape hatch: env-var-first (pre-fix behavior).
+  if (trustEnv) {
+    if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
+    if (process.env.CODEX_THREAD_ID) return process.env.CODEX_THREAD_ID;
+    if (process.env.CODEX_SESSION_ID) return process.env.CODEX_SESSION_ID;
+    return undefined;
+  }
+
+  // 1. PID-scoped marker (authoritative per live Codex ancestor PID)
+  const fromMarker = readSessionMarker("codex");
+  if (fromMarker) return fromMarker;
+
+  // 2. Codex-native env vars (auto-injected by Codex CLI into all hooks)
   if (process.env.CODEX_THREAD_ID) return process.env.CODEX_THREAD_ID;
   if (process.env.CODEX_SESSION_ID) return process.env.CODEX_SESSION_ID;
+
+  // 3. Cross-harness standard (potentially stale)
+  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
 
   return undefined;
 }
@@ -183,7 +199,16 @@ async function handleCodexSessionStartHookImpl(
     return 0;
   }
 
-  // Codex auto-injects CODEX_THREAD_ID into all hooks — no env file write needed.
+  // Codex passes session_id to hooks via the stdin JSON payload only — there is
+  // no env-var injection equivalent to Claude Code's CLAUDE_ENV_FILE. Persist a
+  // PID-scoped marker so subsequent hooks (Stop, UserPromptSubmit) and any
+  // descendant processes can resolve the session ID by walking up to the
+  // common Codex CLI ancestor PID.
+  try {
+    writeSessionMarker("codex", sessionId);
+  } catch {
+    // Non-fatal: marker is a best-effort mechanism
+  }
 
   const stateDir = resolveCodexStateDir({
     stateDir: args.stateDir,
@@ -199,6 +224,7 @@ async function handleCodexSessionStartHookImpl(
         iteration: 1,
         maxIterations: 256,
         runId: "",
+        runIds: [],
         startedAt: nowTs,
         lastIterationAt: nowTs,
         iterationTimes: [],
@@ -346,6 +372,11 @@ export function createCodexAdapter(): HarnessAdapter {
     },
 
     async bindSession(opts: SessionBindOptions): Promise<SessionBindResult> {
+      // Delegates to the Claude adapter intentionally: bindSessionImpl only
+      // manages the generic session-state file (<stateDir>/<sessionId>.md),
+      // which has identical format/semantics across both harnesses. It does
+      // NOT touch CLAUDE_ENV_FILE, so it is safe to reuse for codex. We
+      // override only the returned `harness` field below.
       const stateDir = resolveCodexStateDir({
         stateDir: opts.stateDir,
         pluginRoot: opts.pluginRoot,

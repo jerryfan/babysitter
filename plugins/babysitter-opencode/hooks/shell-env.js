@@ -18,13 +18,15 @@
 "use strict";
 
 const { readFileSync, mkdirSync, appendFileSync, existsSync } = require("fs");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 
 const PLUGIN_ROOT = process.env.OPENCODE_PLUGIN_ROOT || path.resolve(__dirname, "..");
-const STATE_DIR = process.env.BABYSITTER_STATE_DIR || path.join(process.cwd(), ".a5c");
-const RUNS_DIR = process.env.BABYSITTER_RUNS_DIR || path.join(STATE_DIR, "runs");
-const LOG_DIR = process.env.BABYSITTER_LOG_DIR || path.join(PLUGIN_ROOT, ".a5c", "logs");
+const GLOBAL_ROOT = process.env.BABYSITTER_GLOBAL_STATE_DIR || path.join(os.homedir(), ".a5c");
+const STATE_DIR = process.env.BABYSITTER_STATE_DIR || path.join(GLOBAL_ROOT, "state");
+const RUNS_DIR = process.env.BABYSITTER_RUNS_DIR || path.join(GLOBAL_ROOT, "runs");
+const LOG_DIR = process.env.BABYSITTER_LOG_DIR || path.join(GLOBAL_ROOT, "logs");
 const LOG_FILE = path.join(LOG_DIR, "babysitter-shell-env-hook.log");
 
 function ensureDir(dir) {

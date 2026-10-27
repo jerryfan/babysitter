@@ -7,6 +7,7 @@ const { spawnSync } = require('child_process');
 
 const PLUGIN_NAME = 'babysitter';
 const PLUGIN_CATEGORY = 'Coding';
+const LEGACY_MARKETPLACE_PLUGIN_NAMES = ['babysitter-codex'];
 const LEGACY_SKILL_NAMES = [
   'babysit',
   'babysitter-codex',
@@ -58,12 +59,13 @@ const DEFAULT_MARKETPLACE = {
 };
 const PLUGIN_BUNDLE_ENTRIES = [
   '.codex-plugin',
-  '.app.json',
   'assets',
   'hooks',
   'hooks.json',
   'skills',
-  'babysitter.lock.json',
+  '.app.json',
+  'plugin.lock.json',
+  'README.md',
 ];
 
 function getCodexHome() {
@@ -88,7 +90,7 @@ function getHomePluginRoot() {
   if (process.env.BABYSITTER_CODEX_PLUGIN_DIR) {
     return path.resolve(process.env.BABYSITTER_CODEX_PLUGIN_DIR, PLUGIN_NAME);
   }
-  return path.join(getCodexHome(), 'plugins', PLUGIN_NAME);
+  return path.join(getUserHome(), '.agents', 'plugins', PLUGIN_NAME);
 }
 
 function getHomeMarketplacePath() {
@@ -315,13 +317,21 @@ function ensureExecutable(filePath) {
   }
 }
 
+function getMarketplaceRootDir(marketplacePath) {
+  const pluginsDir = path.dirname(marketplacePath);
+  const dotAgentsDir = path.dirname(pluginsDir);
+  return path.dirname(dotAgentsDir);
+}
+
 function normalizeMarketplaceSourcePath(marketplacePath, pluginSourcePath) {
-  let next = pluginSourcePath;
-  if (path.isAbsolute(next)) {
-    next = path.relative(path.dirname(marketplacePath), next);
-  }
+  let next = path.relative(getMarketplaceRootDir(marketplacePath), pluginSourcePath);
   next = String(next || '').replace(/\\/g, '/');
-  if (!next.startsWith('./') && !next.startsWith('../')) {
+  if (!next || next === '.' || next.startsWith('../')) {
+    throw new Error(
+      `Plugin source path must live under ${getMarketplaceRootDir(marketplacePath)} so Codex can load it via a ./-prefixed marketplace entry.`,
+    );
+  }
+  if (!next.startsWith('./')) {
     next = `./${next}`;
   }
   return next;
@@ -347,15 +357,15 @@ function ensureMarketplaceEntry(marketplacePath, pluginSourcePath) {
     },
     category: PLUGIN_CATEGORY,
   };
-  const existingIndex = Array.isArray(marketplace.plugins)
-    ? marketplace.plugins.findIndex((entry) => entry && entry.name === PLUGIN_NAME)
-    : -1;
   if (!Array.isArray(marketplace.plugins)) {
     marketplace.plugins = [nextEntry];
-  } else if (existingIndex >= 0) {
-    marketplace.plugins[existingIndex] = nextEntry;
   } else {
-    marketplace.plugins.push(nextEntry);
+    const sanitized = marketplace.plugins.filter((entry) => (
+      entry &&
+      entry.name !== PLUGIN_NAME &&
+      !LEGACY_MARKETPLACE_PLUGIN_NAMES.includes(entry.name)
+    ));
+    marketplace.plugins = [...sanitized, nextEntry];
   }
   writeJson(marketplacePath, marketplace);
   return nextEntry;
@@ -369,7 +379,11 @@ function removeMarketplaceEntry(marketplacePath) {
   if (!Array.isArray(marketplace.plugins)) {
     return;
   }
-  marketplace.plugins = marketplace.plugins.filter((entry) => entry && entry.name !== PLUGIN_NAME);
+  marketplace.plugins = marketplace.plugins.filter((entry) => (
+    entry &&
+    entry.name !== PLUGIN_NAME &&
+    !LEGACY_MARKETPLACE_PLUGIN_NAMES.includes(entry.name)
+  ));
   writeJson(marketplacePath, marketplace);
 }
 
@@ -489,8 +503,11 @@ function warnWindowsHooks() {
   if (process.platform !== 'win32') {
     return;
   }
-  console.warn('[babysitter] Warning: Codex hooks are currently disabled on native Windows.');
-  console.warn('[babysitter] The plugin will install correctly, but SessionStart/UserPromptSubmit/Stop hooks will not fire until Codex enables Windows hook execution.');
+  // Codex enabled Windows hooks in v0.119.0 (2026-04-10, openai/codex#17268).
+  // Older Codex CLIs still skip hook execution on Windows; warn so users on
+  // pinned/older versions know to upgrade.
+  console.warn('[babysitter] Note: Codex hooks on Windows require Codex CLI >= 0.119.0.');
+  console.warn('[babysitter] If hooks do not fire, run `codex --version` and upgrade if you are below 0.119.0.');
 }
 
 module.exports = {

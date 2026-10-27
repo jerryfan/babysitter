@@ -11,7 +11,7 @@ import type {
 import { HarnessCapability as Cap } from "./types";
 import type { PromptContext } from "../prompts/types";
 import { createOhMyPiContext } from "../prompts/context";
-import { getGlobalStateDir } from "../config";
+import { normalizeSessionStateDir } from "../config";
 import {
   getCurrentTimestamp,
   getSessionFilePath,
@@ -22,6 +22,7 @@ import {
 } from "../session";
 import type { SessionState } from "../session";
 import { installCliViaNpm, runPackageBinaryViaNpx } from "./installSupport";
+import { writeSessionMarker, resolveSessionIdWithMarker } from "./sessionMarker";
 
 function resolveOhMyPiPluginRoot(
   args: { pluginRoot?: string } = {},
@@ -34,15 +35,13 @@ function resolveOhMyPiStateDir(args: {
   stateDir?: string;
   pluginRoot?: string;
 }): string {
-  if (args.stateDir) return path.resolve(args.stateDir);
-  return getGlobalStateDir();
+  return normalizeSessionStateDir(
+    args.stateDir ?? process.env.BABYSITTER_STATE_DIR,
+  );
 }
 
 function resolveOhMyPiSessionId(parsed: { sessionId?: string }): string | undefined {
-  if (parsed.sessionId) return parsed.sessionId;
-  if (process.env.BABYSITTER_SESSION_ID) return process.env.BABYSITTER_SESSION_ID;
-  if (process.env.OMP_SESSION_ID) return process.env.OMP_SESSION_ID;
-  return undefined;
+  return resolveSessionIdWithMarker("oh-my-pi", parsed, ["OMP_SESSION_ID"]);
 }
 
 async function bindOhMyPiSession(
@@ -83,6 +82,7 @@ async function bindOhMyPiSession(
     iteration: 1,
     maxIterations: opts.maxIterations ?? 256,
     runId: opts.runId,
+    runIds: [],
     startedAt: now,
     lastIterationAt: now,
     iterationTimes: [],
@@ -175,6 +175,15 @@ export function createOhMyPiAdapter(): HarnessAdapter {
     },
 
     handleSessionStartHook(_args: HookHandlerArgs): Promise<number> {
+      const sessionId =
+        process.env.OMP_SESSION_ID || process.env.BABYSITTER_SESSION_ID;
+      if (sessionId) {
+        try {
+          writeSessionMarker("oh-my-pi", sessionId);
+        } catch {
+          // Non-fatal
+        }
+      }
       writeNoopHookResult();
       return Promise.resolve(0);
     },

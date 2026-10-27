@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import os from "os";
 import path from "path";
 import { promises as fs } from "fs";
@@ -9,6 +9,7 @@ import { storeTaskArtifacts } from "../../storage/storeTaskArtifacts";
 import { getDiskUsage, findOrphanedBlobs } from "../../storage/cleanup";
 import { acquireRunLock, releaseRunLock } from "../../storage/lock";
 import { readRunMetadata } from "../../storage/runFiles";
+import { __resetICloudDriveWarningCacheForTests } from "../../storage/icloudWarning";
 
 let tmpRoot: string;
 
@@ -17,6 +18,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  __resetICloudDriveWarningCacheForTests();
   await fs.rm(tmpRoot, { recursive: true, force: true });
 });
 
@@ -245,5 +247,72 @@ describe("storage primitives", () => {
     expect(lock2.pid).toBe(process.pid);
     expect(lock2.owner).toBe("owner-b");
     await releaseRunLock(runDir);
+  });
+
+  test("warns once when run state is placed inside iCloud Drive", async () => {
+    const stderrChunks: string[] = [];
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(((chunk: string | Uint8Array) => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+      return true;
+    }) as typeof process.stderr.write);
+
+    try {
+      const runsRoot = path.join(
+        tmpRoot,
+        "Library",
+        "Mobile Documents",
+        "com~apple~CloudDocs",
+        "project",
+        ".a5c",
+        "runs",
+      );
+      const { runDir } = await createRunDir({
+        runsRoot,
+        runId: "run-icloud",
+        request: "icloud-warning",
+        processPath: ".a5c/processes/foo.js",
+      });
+
+      await appendEvent({ runDir, eventType: "RUN_CREATED", event: { ok: true } });
+
+      const stderr = stderrChunks.join("");
+      expect(stderr).toContain("Babysitter state is inside iCloud Drive");
+      expect(stderr).toContain("issues/77");
+      expect(stderr.match(/Babysitter state is inside iCloud Drive/g)).toHaveLength(1);
+    } finally {
+      stderrSpy.mockRestore();
+    }
+  });
+
+  test("createRunDir auto-creates parent package.json with type:module", async () => {
+    const runsRoot = path.join(tmpRoot, "dot-a5c", "runs");
+    await createRunDir({
+      runsRoot,
+      runId: "run-pkg",
+      request: "pkg-test",
+    });
+    const pkgPath = path.join(tmpRoot, "dot-a5c", "package.json");
+    const content = JSON.parse(await fs.readFile(pkgPath, "utf8"));
+    expect(content).toEqual({ type: "module" });
+  });
+
+  test("createRunDir does not overwrite existing parent package.json", async () => {
+    const parentDir = path.join(tmpRoot, "existing-parent");
+    const runsRoot = path.join(parentDir, "runs");
+    await fs.mkdir(parentDir, { recursive: true });
+    await fs.writeFile(
+      path.join(parentDir, "package.json"),
+      JSON.stringify({ name: "my-project", type: "commonjs" }),
+    );
+    await createRunDir({
+      runsRoot,
+      runId: "run-existing-pkg",
+      request: "existing-pkg-test",
+    });
+    const content = JSON.parse(
+      await fs.readFile(path.join(parentDir, "package.json"), "utf8"),
+    );
+    expect(content.name).toBe("my-project");
+    expect(content.type).toBe("commonjs");
   });
 });

@@ -16,8 +16,14 @@ import {
   composeProcessCreatePrompt,
   composeOrchestrationPrompt,
   composeBreakpointPrompt,
+  PART_STRATA_MAP,
+  composeByStrata,
+  detectExecutionContext,
+  deriveCapabilityFlags,
+  renderCapabilityProcessGuide,
+  processPathsForCapabilities,
 } from "../../prompts";
-import type { PromptContext } from "../../prompts";
+import type { PromptContext, StratumTaggedPart } from "../../prompts";
 import {
   resolveActiveProcessLibrary,
   getDefaultProcessLibrarySpec,
@@ -30,6 +36,7 @@ export interface InstructionsCommandArgs {
   harness: string;
   interactive: boolean | undefined;
   json: boolean;
+  showStrata?: boolean;
 }
 
 /**
@@ -47,6 +54,8 @@ type ComposerEntry = {
   fn: (ctx: PromptContext) => string;
   promptType: string;
   partsIncluded: string[];
+  /** Tagged parts for strata-aware composition (GAP-PROMPT-001) */
+  strataParts: string[];
 };
 
 const COMPOSERS: Record<InstructionsCommandArgs["subcommand"], ComposerEntry> = {
@@ -55,11 +64,21 @@ const COMPOSERS: Record<InstructionsCommandArgs["subcommand"], ComposerEntry> = 
     promptType: "babysit-skill",
     partsIncluded: [
       "non-negotiables", "dependencies", "interview", "user-profile",
-      "process-creation", "intent-fidelity-checks", "run-creation",
+      "process-creation", "intent-fidelity-checks", "run-overlap-detection", "run-creation",
       "iteration", "effects", "breakpoint-handling", "results-posting",
       "loop-control", "completion-proof", "task-kinds", "task-examples",
       "quick-reference", "recovery", "process-guidelines", "critical-rules",
       "see-also",
+      "project-instructions",
+    ],
+    strataParts: [
+      "renderNonNegotiables", "renderDependencies", "renderInterview", "renderUserProfile",
+      "renderProcessCreation", "renderIntentFidelityChecks", "renderRunOverlapDetection",
+      "renderRunCreation", "renderIteration", "renderEffects", "renderBreakpointHandling",
+      "renderResultsPosting", "renderLoopControl", "renderCompletionProof",
+      "renderTaskKinds", "renderTaskExamples", "renderQuickReference", "renderRecovery",
+      "renderProcessGuidelines", "renderCriticalRules", "renderSeeAlso",
+      "renderProjectInstructions",
     ],
   },
   "process-create": {
@@ -68,22 +87,35 @@ const COMPOSERS: Record<InstructionsCommandArgs["subcommand"], ComposerEntry> = 
     partsIncluded: [
       "interview", "user-profile", "process-creation",
       "intent-fidelity-checks", "process-guidelines",
-      "task-kinds", "task-examples",
+      "parallel-phase-detection", "task-kinds", "task-examples",
+      "project-instructions",
+    ],
+    strataParts: [
+      "renderInterview", "renderUserProfile", "renderProcessCreation",
+      "renderIntentFidelityChecks", "renderProcessGuidelines",
+      "renderParallelPhaseDetection", "renderTaskKinds", "renderTaskExamples",
+      "renderProjectInstructions",
     ],
   },
   "orchestrate": {
     fn: composeOrchestrationPrompt,
     promptType: "orchestrate",
     partsIncluded: [
-      "run-creation", "iteration", "effects", "breakpoint-handling",
+      "run-overlap-detection", "run-creation", "iteration", "effects", "breakpoint-handling",
       "results-posting", "loop-control", "completion-proof",
       "quick-reference", "recovery", "critical-rules",
+    ],
+    strataParts: [
+      "renderRunOverlapDetection", "renderRunCreation", "renderIteration", "renderEffects",
+      "renderBreakpointHandling", "renderResultsPosting", "renderLoopControl",
+      "renderCompletionProof", "renderQuickReference", "renderRecovery", "renderCriticalRules",
     ],
   },
   "breakpoint-handling": {
     fn: composeBreakpointPrompt,
     promptType: "breakpoint-handling",
     partsIncluded: ["breakpoint-handling", "results-posting"],
+    strataParts: ["renderBreakpointHandling", "renderResultsPosting"],
   },
 };
 
@@ -128,7 +160,7 @@ async function tryResolveProcessLibraryRoot(): Promise<{
     if (resolved.binding?.dir) {
       const defaultSpec = getDefaultProcessLibrarySpec();
       return {
-        processLibraryRoot: resolved.binding.dir,
+        processLibraryRoot: defaultSpec.processRoot,
         processLibraryReferenceRoot: defaultSpec.referenceRoot,
       };
     }
@@ -142,10 +174,13 @@ async function tryResolveProcessLibraryRoot(): Promise<{
  * Detect whether the session-start hook has actually run by checking for the
  * session state file it creates (`<stateDir>/<sessionId>.md`).
  *
- * Some adapters can resolve a session ID from env vars alone (e.g.
- * GEMINI_SESSION_ID, CODEX_SESSION_ID) without the hook ever firing.
- * The definitive signal is the state file — the hook writes it as a
- * side effect of `babysitter hook:run --hook-type session-start`.
+ * The definitive signal is now the PID-scoped session marker written by the
+ * session-start hook; absence of the marker (even when env vars like
+ * GEMINI_SESSION_ID / CODEX_SESSION_ID / BABYSITTER_SESSION_ID are present)
+ * usually means hooks did not fire. Env-var-only resolution is a fallback
+ * path that may bind to stale IDs inherited from ancestor shells, so it
+ * cannot be trusted as proof that hooks are active. The hook writes the
+ * state file as a side effect of `babysitter hook:run --hook-type session-start`.
  */
 function detectHooksActive(harness: string): boolean {
   const adapter = getAdapterByName(harness);
@@ -215,12 +250,29 @@ export async function handleInstructionsCommand(
     hookOverride.hookDriven = false;
   }
 
+  // Detect execution context (CI, trigger, branch, actor) and derive
+  // capability flags so the babysit skill can select context-appropriate
+  // library processes when dispatching (e.g. GitHub collaboration,
+  // scheduled reporting, local-dev relaxations).
+  const executionContext = detectExecutionContext();
+  const capabilityFlags = deriveCapabilityFlags(executionContext);
+
   const ctx = factory({
     interactive: args.interactive,
     ...libraryInfo,
     ...hookOverride,
   });
-  const content = composer.fn(ctx);
+
+  // GAP-PROMPT-001: Use strata-aware composition when --show-strata is set
+  let content: string;
+  if (args.showStrata) {
+    const taggedParts: StratumTaggedPart[] = composer.strataParts
+      .map(name => PART_STRATA_MAP[name])
+      .filter((p): p is StratumTaggedPart => p != null);
+    content = composeByStrata(taggedParts, ctx, { showStrata: true });
+  } else {
+    content = composer.fn(ctx);
+  }
 
   if (args.json) {
     console.log(
@@ -231,6 +283,9 @@ export async function handleInstructionsCommand(
           promptType: composer.promptType,
           hookDriven: ctx.hookDriven,
           hooksDetected: hooksActive,
+          executionContext,
+          capabilityFlags,
+          suggestedProcesses: processPathsForCapabilities(capabilityFlags),
           content,
           partsIncluded: composer.partsIncluded,
         },
@@ -245,7 +300,27 @@ export async function handleInstructionsCommand(
       // clarifies the JSON output. The text output is self-explanatory
       // from the generated instructions.
     }
-    console.log(content);
+    const activeCapabilities = Object.entries(capabilityFlags)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k);
+    const contextHeader = [
+      '## Execution Context',
+      '',
+      `- CI: \`${executionContext.ci}\``,
+      `- Trigger: \`${executionContext.trigger}\``,
+      executionContext.branch.ref ? `- Branch: \`${executionContext.branch.ref}\`` : undefined,
+      executionContext.repo ? `- Repo: \`${executionContext.repo.owner}/${executionContext.repo.name}\`` : undefined,
+      executionContext.actor ? `- Actor: \`${executionContext.actor.login}\`${executionContext.actor.isBot ? ' (bot)' : ''}` : undefined,
+      '',
+      `Active context capabilities: ${activeCapabilities.length > 0 ? activeCapabilities.map(c => `\`${c}\``).join(', ') : '_(none)_'}`,
+      '',
+      'When selecting library processes to dispatch, prefer those whose triggers match the active capabilities above.',
+      '',
+      '---',
+      '',
+    ].filter((l): l is string => l !== undefined).join('\n');
+    const processGuide = renderCapabilityProcessGuide(capabilityFlags);
+    console.log(contextHeader + processGuide + content);
   }
 
   return 0;

@@ -28,8 +28,21 @@ import {
 import { emitRuntimeMetric } from "../instrumentation";
 import { createTaskBuildContext } from "../../tasks/context";
 import { collapseDoubledA5cRuns } from "../../cli/resolveInputPath";
+import { getGlobalLogDir } from "../../config/defaults";
 import { globalTaskRegistry } from "../../tasks/registry";
 import { serializeAndWriteTaskDefinition } from "../../tasks/serializer";
+import { readRules } from "../../breakpoints/rules";
+import { evaluateAutoApproval } from "../../breakpoints/evaluator";
+import type { PolicyEngine, PolicyEvaluationContext } from "../../governance/types";
+import { logPolicyDecision } from "../../governance/logging";
+
+
+// Synchronous counter incremented at the start of requestNewEffect, BEFORE any
+// async I/O.  Allows orchestrateIteration to detect un-awaited ctx.task() calls
+// without waiting for disk writes to complete.
+let _newEffectRequestCount = 0;
+export function getNewEffectRequestCount(): number { return _newEffectRequestCount; }
+export function resetNewEffectRequestCount(): void { _newEffectRequestCount = 0; }
 
 export interface TaskIntrinsicContext {
   runId: string;
@@ -39,6 +52,7 @@ export interface TaskIntrinsicContext {
   replayCursor: ReplayCursor;
   now: () => Date;
   logger?: ProcessLogger;
+  policyEngine?: PolicyEngine;
 }
 
 export interface TaskIntrinsicInvokeOptions<TArgs, TResult> {
@@ -56,7 +70,10 @@ export async function runTaskIntrinsic<TArgs, TResult>(
     throw new InvalidTaskDefinitionError("ctx.task requires a DefinedTask created via defineTask()");
   }
 
-  const stepId = options.context.replayCursor.nextStepId();
+  // When stableKey is provided, do NOT advance the replay cursor — all calls with
+  // the same stableKey hash to the same effect slot, preventing phantom duplicate
+  // effects from retry loops (issue #126).
+  const stepId = options.invokeOptions?.stableKey ?? options.context.replayCursor.nextStepId();
   const invocation = hashInvocationKey({
     processId: options.context.processId,
     stepId,
@@ -81,6 +98,19 @@ async function handleExistingInvocation<TArgs, TResult>(
   }
 
   if (record.status === "resolved_error") {
+    if (record.kind === "shell") {
+      const storedShellResult = await readTaskResult(
+        options.context.runDir,
+        record.effectId,
+        record.resultRef ? normalizeRef(options.context.runDir, record.resultRef) : undefined
+      );
+      if (!storedShellResult) {
+        throw new RunFailedError(`Result for effect ${record.effectId} is missing from disk`, {
+          effectId: record.effectId,
+        });
+      }
+      return await coerceStoredShellFailureResult(options.context.runDir, storedShellResult) as TResult;
+    }
     const error = record.error ? rehydrateSerializedError(record.error) : new Error("Task failed");
     throw error;
   }
@@ -109,6 +139,7 @@ async function requestNewEffect<TArgs, TResult>(
   invocationHash: string,
   options: TaskIntrinsicInvokeOptions<TArgs, TResult>
 ): Promise<TResult> {
+  _newEffectRequestCount++;
   const effectId = nextUlid();
   const buildCtx = createTaskBuildContext({
     effectId,
@@ -121,6 +152,58 @@ async function requestNewEffect<TArgs, TResult>(
   const taskDef = await Promise.resolve(options.task.build(options.args, buildCtx));
   if (!taskDef || typeof taskDef.kind !== "string") {
     throw new InvalidTaskDefinitionError(`Task ${options.task.id} did not provide a kind`);
+  }
+
+  // ── Governance policy evaluation (GAP-SEC-001) ──────────────────
+  // Evaluate policies BEFORE writing task artifacts or journal events.
+  if (options.context.policyEngine) {
+    const policyCtx: PolicyEvaluationContext = {
+      effectKind: taskDef.kind,
+      taskId: options.task.id,
+      processId: options.context.processId,
+      runId: options.context.runId,
+      labels: taskDef.labels,
+      metadata: taskDef.metadata as Record<string, string> | undefined,
+    };
+    const decision = options.context.policyEngine.evaluate(policyCtx);
+
+    // Audit-log every policy evaluation
+    const logDir = path.join(getGlobalLogDir(), options.context.runId);
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      context: policyCtx,
+      decision,
+      ruleId: decision.rule?.id,
+    };
+    try { await logPolicyDecision(logDir, logEntry); } catch { /* best-effort */ }
+
+    if (!decision.allowed) {
+      throw new RunFailedError(
+        `Policy denied effect dispatch: ${decision.reason} [rule: ${decision.rule?.id ?? "unknown"}]`,
+        { details: { ruleId: decision.rule?.id, decision } },
+      );
+    }
+  }
+
+  // Pre-compute autoApproval for breakpoint effects
+  if (taskDef.kind === "breakpoint") {
+    try {
+      const meta = taskDef.metadata as Record<string, unknown> | undefined;
+      const breakpointId = meta?.breakpointId as string | undefined;
+      if (breakpointId) {
+        const rules = await readRules();
+        const autoApproval = evaluateAutoApproval({
+          breakpointId,
+          tags: meta?.tags as string[] | undefined,
+          expert: meta?.expert as string | undefined,
+          rules,
+          autoApproveAfterN: meta?.autoApproveAfterN as number | undefined,
+        });
+        (taskDef as Record<string, unknown>).autoApproval = autoApproval;
+      }
+    } catch {
+      // Non-critical: skip autoApproval if evaluation fails
+    }
   }
   const { taskRef: taskDefRef, inputsRef } = await serializeAndWriteTaskDefinition({
     runDir: options.context.runDir,
@@ -264,7 +347,66 @@ async function resolveStoredResultValue(runDir: string, stored: StoredTaskResult
     const raw = await fs.readFile(absolute, "utf8");
     return JSON.parse(raw) as unknown;
   }
-  throw new RunFailedError("Result payload missing data", { effectId: stored.effectId });
+  // Graceful fallback: when a harness marks a task as "ok" but omits the value
+  // payload (e.g. LLM agent completed work without returning structured data),
+  // return null instead of crashing the run.  The process can still inspect
+  // stdout/stderr for output.  A hard failure here previously caused ~90% of
+  // provider-gated E2E runs to fail.
+  return null;
+}
+
+async function coerceStoredShellFailureResult(runDir: string, stored: StoredTaskResult): Promise<{
+  success: false;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  error: string;
+}> {
+  const errorData = isJsonRecord(stored.error?.data) ? stored.error.data : undefined;
+  const stdout = await resolveStoredTextArtifact(runDir, stored.stdoutRef)
+    ?? readStringField(errorData, "stdout")
+    ?? "";
+  const stderr = await resolveStoredTextArtifact(runDir, stored.stderrRef)
+    ?? readStringField(errorData, "stderr")
+    ?? "";
+  const exitCode = readNumberField(errorData, "exitCode") ?? 1;
+  const errorMessage = readStringField(errorData, "error")
+    ?? stored.error?.message
+    ?? `Shell command exited with code ${exitCode}`;
+
+  return {
+    success: false,
+    exitCode,
+    stdout,
+    stderr,
+    error: errorMessage,
+  };
+}
+
+async function resolveStoredTextArtifact(runDir: string, ref?: string): Promise<string | undefined> {
+  if (!ref) {
+    return undefined;
+  }
+  try {
+    const absolute = normalizeRef(runDir, ref);
+    return await fs.readFile(absolute, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringField(value: Record<string, unknown> | undefined, key: string): string | undefined {
+  const candidate = value?.[key];
+  return typeof candidate === "string" ? candidate : undefined;
+}
+
+function readNumberField(value: Record<string, unknown> | undefined, key: string): number | undefined {
+  const candidate = value?.[key];
+  return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
 }
 
 function collectInvocationLabels(ctx: TaskBuildContext, taskDef: TaskDef): string[] {
